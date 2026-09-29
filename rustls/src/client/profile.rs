@@ -106,4 +106,24 @@ pub trait ClientHelloProfile: fmt::Debug + Send + Sync {
         let _ = client_random;
         None
     }
+
+    /// Extensions to advertise verbatim, for types rustls has no
+    /// implementation for.
+    ///
+    /// Each `(type, body)` pair is emitted as given: the body is not
+    /// interpreted, and the type takes part in [`Self::extension_order`] like
+    /// every other extension in the offer.  This exists to reproduce someone
+    /// else's offer, which is why the bytes are stated rather than derived: a
+    /// profile that advertises something rustls cannot honour is asking for a
+    /// handshake that dies when a server takes it up.
+    ///
+    /// For a type rustls has a slot for (for example `renegotiation_info`) the
+    /// bytes given here win, and the slot is left out of the offer; this is the
+    /// only way a profile can state, say, a renegotiation extension rustls
+    /// would not otherwise send.  The ECH and PSK tail extensions cannot be
+    /// named: their position is mandated, so they are not orderable and not
+    /// replaceable.
+    fn raw_extensions(&self) -> Vec<(ExtensionType, Vec<u8>)> {
+        Vec::new()
+    }
 }

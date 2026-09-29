@@ -872,6 +872,20 @@ impl Codec<'_> for ServerTicketRequestHint {
     }
 }
 
+/// An extension carried through the encoder verbatim.
+///
+/// This is for a type the encoder has no interpretation for: a
+/// [`ClientHelloProfile`] uses it to advertise extensions whose bytes it can
+/// state but whose behaviour rustls does not implement.  A server that takes
+/// one of these up ends the handshake, since nothing here could act on it.
+///
+/// [`ClientHelloProfile`]: crate::client::ClientHelloProfile
+#[derive(Clone, Debug)]
+pub(crate) struct RawExtension {
+    pub(crate) typ: ExtensionType,
+    pub(crate) data: Vec<u8>,
+}
+
 extension_struct! {
     /// A representation of extensions present in a `ClientHello` message
     ///
@@ -982,6 +996,10 @@ extension_struct! {
 
         /// Extensions that must appear contiguously.
         pub(crate) contiguous_extensions: Vec<ExtensionType>,
+
+        /// Extensions carried verbatim, for types this structure does not
+        /// interpret.  They take part in the ordering like any other.
+        pub(crate) raw_extensions: Vec<RawExtension>,
     }
 }
 
@@ -1014,6 +1032,7 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            raw_extensions,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -1042,6 +1061,7 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            raw_extensions,
         }
     }
 
@@ -1079,6 +1099,11 @@ impl ClientExtensions<'_> {
     ///   are required to be last by the standard.
     pub(crate) fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
         let mut order = self.collect_used();
+        for ext in &self.raw_extensions {
+            if !order.contains(&ext.typ) {
+                order.push(ext.typ);
+            }
+        }
 
         // Remove extensions which have specific order requirements.
         order.retain(|ext| {
@@ -1109,7 +1134,18 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
 
         let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
         for item in order {
-            self.encode_one(item, body.buf);
+            match self
+                .raw_extensions
+                .iter()
+                .find(|ext| ext.typ == item)
+            {
+                Some(ext) => {
+                    item.encode(body.buf);
+                    let inner = LengthPrefixedBuffer::new(ListLength::U16, body.buf);
+                    inner.buf.extend_from_slice(&ext.data);
+                }
+                None => self.encode_one(item, body.buf),
+            }
         }
     }
 

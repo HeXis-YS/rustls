@@ -32,7 +32,7 @@ use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
     ClientSessionTicket, ClientTicketRequest, EncryptedClientHello, HandshakeMessagePayload,
     HandshakePayload, HelloRetryRequest, KeyShareEntry, ProtocolName, PskKeyExchangeModes, Random,
-    ServerNamePayload, SessionId, SupportedEcPointFormats, SupportedProtocolVersions,
+    RawExtension, ServerNamePayload, SessionId, SupportedEcPointFormats, SupportedProtocolVersions,
     TransportParameters,
 };
 use crate::msgs::message::{Message, MessagePayload};
@@ -291,6 +291,16 @@ fn emit_client_hello_for_retry(
         protocols: extra_exts.protocols.clone(),
         ..Default::default()
     });
+
+    // Extensions a profile advertises verbatim.  Installed here so they join
+    // the ordering below like any other extension in the offer.
+    if let Some(profile) = config.client_hello_profile.as_ref() {
+        exts.raw_extensions = profile
+            .raw_extensions()
+            .into_iter()
+            .map(|(typ, data)| RawExtension { typ, data })
+            .collect();
+    }
 
     if !config
         .crypto_provider()

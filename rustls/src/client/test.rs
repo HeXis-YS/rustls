@@ -114,6 +114,67 @@ mod tests {
         assert!(order.len() > 3, "expected the offered set, got {order:?}");
     }
 
+    /// The extensions Firefox 153 advertises for features rustls does not
+    /// implement, with the bytes the capture shows.  They are emitted verbatim,
+    /// participate in the profile's order, and one of them replaces a slot
+    /// rustls has (`renegotiation_info`) rather than being sent twice.
+    #[test]
+    fn client_hello_profile_emits_raw_extensions_verbatim() {
+        let profile = Arc::new(RawExtensions {
+            raw: vec![
+                (ExtensionType::SCT, vec![]),
+                (ExtensionType::RecordSizeLimit, vec![0x40, 0x01]),
+                (
+                    ExtensionType::DelegatedCredentials,
+                    vec![0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03],
+                ),
+                (ExtensionType::RenegotiationInfo, vec![0x00]),
+            ],
+            ..Default::default()
+        });
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_profile = Some(profile.clone());
+
+        let exts = client_hello_extensions(config).unwrap();
+        let body = |typ| {
+            let mut found = exts.iter().filter(|(t, _)| *t == typ);
+            let first = found
+                .next()
+                .map(|(_, body)| body.clone());
+            assert!(found.next().is_none(), "{typ:?} emitted more than once");
+            first
+        };
+        assert_eq!(body(ExtensionType::SCT), Some(vec![]));
+        assert_eq!(body(ExtensionType::RecordSizeLimit), Some(vec![0x40, 0x01]));
+        assert_eq!(
+            body(ExtensionType::DelegatedCredentials),
+            Some(vec![
+                0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03
+            ])
+        );
+        assert_eq!(body(ExtensionType::RenegotiationInfo), Some(vec![0x00]));
+
+        // The raw types are offered to `extension_order`, so a permutation that
+        // names them fixes their position like any other extension.
+        let offered = profile
+            .offered
+            .get()
+            .expect("profile was consulted");
+        for typ in [
+            ExtensionType::SCT,
+            ExtensionType::RecordSizeLimit,
+            ExtensionType::DelegatedCredentials,
+            ExtensionType::RenegotiationInfo,
+        ] {
+            assert!(offered.contains(&typ), "{typ:?} missing from {offered:?}");
+        }
+    }
+
     /// Firefox derives `legacy_session_id` from `ClientHello.random`
     /// (`ssl_MakeFakeSid`) so the field costs no entropy and a passive observer
     /// can recompute it.  A profile states that derivation; the point of the
@@ -1025,6 +1086,50 @@ fn fake_sid(random: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+/// The ClientHello extensions as `(type, body)` pairs, in wire order.
+fn client_hello_extensions(config: ClientConfig) -> Result<Vec<(ExtensionType, Vec<u8>)>, Error> {
+    let mut conn =
+        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
+    let mut bytes = Vec::new();
+    conn.write_tls(&mut bytes).unwrap();
+
+    let mut reader = Reader::init(&bytes);
+    let _ = reader.take(5).expect("record header");
+    let _ = reader
+        .take(4)
+        .expect("handshake header");
+    let _ = reader.take(2).expect("legacy version");
+    let _ = reader.take(32).expect("random");
+    let session_id_len = usize::from(u8::read(&mut reader).expect("session id length"));
+    let _ = reader
+        .take(session_id_len)
+        .expect("session id");
+    let cipher_suites_len = usize::from(u16::read(&mut reader).expect("cipher suite length"));
+    let _ = reader
+        .take(cipher_suites_len)
+        .expect("cipher suites");
+    let compression_len = usize::from(u8::read(&mut reader).expect("compression length"));
+    let _ = reader
+        .take(compression_len)
+        .expect("compressions");
+    let extensions_len = usize::from(u16::read(&mut reader).expect("extensions length"));
+    let mut extensions = reader
+        .sub(extensions_len)
+        .expect("extensions");
+
+    let mut out = Vec::new();
+    while extensions.any_left() {
+        let typ = ExtensionType::read(&mut extensions).expect("extension type");
+        let length = usize::from(u16::read(&mut extensions).expect("extension length"));
+        let body = extensions
+            .take(length)
+            .expect("extension body")
+            .to_vec();
+        out.push((typ, body));
+    }
+    Ok(out)
+}
+
 /// Emits the offered extensions in reverse order, recording what it was offered.
 #[derive(Debug, Default)]
 struct ReverseExtensionOrder {
@@ -1057,6 +1162,26 @@ struct FakeSid;
 impl ClientHelloProfile for FakeSid {
     fn session_id(&self, client_random: &[u8; 32]) -> Option<[u8; 32]> {
         Some(fake_sid(client_random))
+    }
+}
+
+/// Advertises raw extensions verbatim, recording the order it was offered.
+#[derive(Debug, Default)]
+struct RawExtensions {
+    raw: Vec<(ExtensionType, Vec<u8>)>,
+    offered: OnceLock<Vec<ExtensionType>>,
+}
+
+impl ClientHelloProfile for RawExtensions {
+    fn raw_extensions(&self) -> Vec<(ExtensionType, Vec<u8>)> {
+        self.raw.clone()
+    }
+
+    fn extension_order(&self, available: &[ExtensionType]) -> Option<Vec<ExtensionType>> {
+        let _ = self.offered.set(available.to_vec());
+        let mut order = available.to_vec();
+        order.reverse();
+        Some(order)
     }
 }
 
