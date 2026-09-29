@@ -587,6 +587,8 @@ pub mod client {
     pub(super) mod handy;
     mod hs;
     mod profile;
+    #[cfg(feature = "aws_lc_rs")]
+    mod profiles;
     #[cfg(test)]
     mod test;
     #[cfg(feature = "tls12")]
@@ -605,6 +607,10 @@ pub mod client {
     #[cfg(any(feature = "std", feature = "hashbrown"))]
     pub use handy::ClientSessionMemoryCache;
     pub use profile::ClientHelloProfile;
+    /// `ClientHello` shapes of released clients, for callers that want to look
+    /// like one of them.
+    #[cfg(feature = "aws_lc_rs")]
+    pub use profiles::FirefoxEsr153;
 
     /// Dangerous configuration that should be audited and used with extreme care.
     pub mod danger {

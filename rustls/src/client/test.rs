@@ -200,9 +200,9 @@ mod tests {
             .clone();
 
         // Two-byte list length, then one `u16` per scheme.
-        assert_eq!(body.len(), 2 + 2 * FirefoxShape::SIGNATURE_SCHEMES.len());
+        assert_eq!(body.len(), 2 + 2 * FIREFOX_ESR153_SIGNATURE_SCHEMES.len());
         let mut expected = Vec::new();
-        for scheme in FirefoxShape::SIGNATURE_SCHEMES {
+        for scheme in FIREFOX_ESR153_SIGNATURE_SCHEMES {
             expected.extend_from_slice(&u16::from(scheme).to_be_bytes());
         }
         assert_eq!(body[2..], expected[..]);
@@ -215,7 +215,7 @@ mod tests {
             .get()
             .expect("profile was consulted");
         assert!(
-            *offered != FirefoxShape::SIGNATURE_SCHEMES,
+            *offered != FIREFOX_ESR153_SIGNATURE_SCHEMES,
             "nothing to override: {offered:?}"
         );
     }
@@ -229,12 +229,7 @@ mod tests {
     #[test]
     fn client_hello_profile_reproduces_firefox_esr153_shape() {
         use crate::crypto::aws_lc_rs::hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
-        use crate::crypto::aws_lc_rs::kx_group::{SECP256R1, X25519, X25519MLKEM768};
         use crate::crypto::hpke::Hpke;
-
-        let mlkem: &'static dyn SupportedKxGroup = X25519MLKEM768;
-        let x25519: &'static dyn SupportedKxGroup = X25519;
-        let p256: &'static dyn SupportedKxGroup = SECP256R1;
 
         let mut config =
             ClientConfig::builder_with_provider(super::provider::default_provider().into())
@@ -242,10 +237,7 @@ mod tests {
                 .unwrap()
                 .with_root_certificates(roots())
                 .with_no_client_auth();
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        config.client_hello_profile = Some(Arc::new(FirefoxShape {
-            key_share_groups: vec![mlkem, x25519, p256],
-        }));
+        crate::client::FirefoxEsr153::new().apply(&mut config);
         // Firefox pads its inner hello to a constant size, so the GREASE ECH
         // extension is the same length in every ClientHello it sends.
         let (placeholder_key, _) = DH_KEM_X25519_HKDF_SHA256_AES_128
@@ -264,7 +256,7 @@ mod tests {
             .map(|(typ, _)| *typ)
             .collect();
 
-        let expected: Vec<_> = FirefoxShape::EXTENSION_ORDER
+        let expected: Vec<_> = FIREFOX_ESR153_EXTENSION_ORDER
             .iter()
             .copied()
             .filter(|typ| *typ != ExtensionType::CompressCertificate || compression)
@@ -298,7 +290,12 @@ mod tests {
         assert!(body(ExtensionType::SCT).is_empty());
         assert_eq!(body(ExtensionType::KeyShare).len(), 1327);
         assert_eq!(body(ExtensionType::SupportedVersions).len(), 5);
-        assert_eq!(body(ExtensionType::SignatureAlgorithms).len(), 24);
+        // Two-byte list length, then Firefox's eleven schemes with no Ed25519.
+        let mut sigalgs = vec![0x00, 0x16];
+        for scheme in FIREFOX_ESR153_SIGNATURE_SCHEMES {
+            sigalgs.extend_from_slice(&u16::from(scheme).to_be_bytes());
+        }
+        assert_eq!(body(ExtensionType::SignatureAlgorithms), sigalgs);
         assert_eq!(body(ExtensionType::PSKKeyExchangeModes).len(), 2);
         assert_eq!(body(ExtensionType::RecordSizeLimit), vec![0x40, 0x01]);
         // Firefox pads the inner hello of its GREASE ECH to a constant size, so
@@ -406,11 +403,22 @@ mod tests {
 
     #[test]
     fn client_hello_profile_pins_cipher_suites_groups_and_key_shares() {
-        // The three dimensions JA3 reads off.  The suite list deliberately
-        // names suites rustls has no implementation for, and the group list
-        // names FFDHE groups no built-in provider supplies: a profile states
-        // someone else's offer, not our capabilities.
+        // Each dimension JA3 reads off reaches the wire as the profile stated
+        // it, in the order it stated.  The lists here are deliberately not what
+        // rustls would have chosen: reversed, thinned and re-ordered.
         let provider = super::provider::default_provider();
+        let cipher_suites: Vec<_> = provider
+            .cipher_suites
+            .iter()
+            .rev()
+            .map(|cs| cs.suite())
+            .collect();
+        let named_groups: Vec<_> = provider
+            .kx_groups
+            .iter()
+            .rev()
+            .map(|group| group.name())
+            .collect();
         let key_share_groups: Vec<_> = provider
             .kx_groups
             .iter()
@@ -428,14 +436,18 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots())
             .with_no_client_auth();
-        config.client_hello_profile = Some(Arc::new(FirefoxShape { key_share_groups }));
+        config.client_hello_profile = Some(Arc::new(PinnedShape {
+            cipher_suites: cipher_suites.clone(),
+            named_groups: named_groups.clone(),
+            key_share_groups,
+        }));
 
         let ch = client_hello_sent_for_config(config).unwrap();
 
-        assert_eq!(ch.cipher_suites, FirefoxShape::CIPHER_SUITES);
+        assert_eq!(ch.cipher_suites, cipher_suites);
         assert_eq!(
             ch.extensions.named_groups.as_deref(),
-            Some(&FirefoxShape::NAMED_GROUPS[..])
+            Some(&named_groups[..])
         );
         assert_eq!(
             ch.extensions
@@ -462,8 +474,9 @@ mod tests {
                 .with_root_certificates(roots())
                 .with_no_client_auth();
         let unstartable: &'static dyn SupportedKxGroup = &UnstartableKxGroup;
-        config.client_hello_profile = Some(Arc::new(FirefoxShape {
+        config.client_hello_profile = Some(Arc::new(PinnedShape {
             key_share_groups: vec![unstartable],
+            ..Default::default()
         }));
 
         assert!(matches!(
@@ -478,21 +491,13 @@ mod tests {
     #[cfg(feature = "aws_lc_rs")]
     #[test]
     fn client_hello_profile_key_shares_match_firefox_sizes() {
-        use crate::crypto::aws_lc_rs::kx_group::{SECP256R1, X25519, X25519MLKEM768};
-
-        let mlkem: &'static dyn SupportedKxGroup = X25519MLKEM768;
-        let x25519: &'static dyn SupportedKxGroup = X25519;
-        let p256: &'static dyn SupportedKxGroup = SECP256R1;
-
         let mut config =
             ClientConfig::builder_with_provider(super::provider::default_provider().into())
                 .with_safe_default_protocol_versions()
                 .unwrap()
                 .with_root_certificates(roots())
                 .with_no_client_auth();
-        config.client_hello_profile = Some(Arc::new(FirefoxShape {
-            key_share_groups: vec![mlkem, x25519, p256],
-        }));
+        crate::client::FirefoxEsr153::new().apply(&mut config);
 
         let ch = client_hello_sent_for_config(config).unwrap();
         let shares = ch
@@ -518,8 +523,9 @@ mod tests {
             .unwrap()
             .with_root_certificates(roots())
             .with_no_client_auth();
-        config.client_hello_profile = Some(Arc::new(FirefoxShape {
-            key_share_groups: provider.kx_groups.clone(),
+        config.client_hello_profile = Some(Arc::new(PinnedShape {
+            cipher_suites: vec![CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256],
+            ..Default::default()
         }));
         let config = Arc::new(config);
 
@@ -1358,6 +1364,32 @@ impl ClientHelloProfile for BogusExtensionOrder {
     }
 }
 
+/// States exactly the dimensions it is given, so a mechanism test can assert
+/// each one reaches the wire unchanged.
+#[derive(Debug, Default)]
+struct PinnedShape {
+    cipher_suites: Vec<CipherSuite>,
+    named_groups: Vec<NamedGroup>,
+    key_share_groups: Vec<&'static dyn SupportedKxGroup>,
+}
+
+impl ClientHelloProfile for PinnedShape {
+    fn cipher_suites(&self, _available: &[SupportedCipherSuite]) -> Option<Vec<CipherSuite>> {
+        (!self.cipher_suites.is_empty()).then(|| self.cipher_suites.clone())
+    }
+
+    fn named_groups(&self, _available: &[NamedGroup]) -> Option<Vec<NamedGroup>> {
+        (!self.named_groups.is_empty()).then(|| self.named_groups.clone())
+    }
+
+    fn key_share_groups(
+        &self,
+        _available: &[&'static dyn SupportedKxGroup],
+    ) -> Option<Vec<&'static dyn SupportedKxGroup>> {
+        (!self.key_share_groups.is_empty()).then(|| self.key_share_groups.clone())
+    }
+}
+
 /// States Firefox's `signature_algorithms`, recording the verifier's list it
 /// replaces.
 #[derive(Debug, Default)]
@@ -1368,7 +1400,7 @@ struct SignatureSchemes {
 impl ClientHelloProfile for SignatureSchemes {
     fn signature_schemes(&self, available: &[SignatureScheme]) -> Option<Vec<SignatureScheme>> {
         let _ = self.offered.set(available.to_vec());
-        Some(FirefoxShape::SIGNATURE_SCHEMES.to_vec())
+        Some(FIREFOX_ESR153_SIGNATURE_SCHEMES.to_vec())
     }
 }
 
@@ -1402,147 +1434,46 @@ impl ClientHelloProfile for RawExtensions {
     }
 }
 
-/// Firefox ESR 153's `ClientHello`, pinned dimension by dimension from the
-/// capture.  Without a profile rustls states its own shape; with this one the
-/// offer is Firefox's, down to the order of the extensions.
-#[derive(Debug)]
-struct FirefoxShape {
-    key_share_groups: Vec<&'static dyn SupportedKxGroup>,
-}
+/// Firefox ESR 153's wire order for its first `ClientHello`, minus ECH GREASE
+/// (`0xfe0d`): rustls emits that one in its position-mandated tail, which is
+/// where Firefox puts it too, so anything the profile offers that is missing
+/// here still lands at the end.  Taken from `parsed-153.3.0esr.txt` (the
+/// `chsni` capture, so `server_name` leads) -- a copy of the capture's numbers,
+/// held here so the shipped [`crate::client::FirefoxEsr153`] is asserted
+/// against the capture rather than against itself.
+const FIREFOX_ESR153_EXTENSION_ORDER: [ExtensionType; 16] = [
+    ExtensionType::ServerName,
+    ExtensionType::ExtendedMasterSecret,
+    ExtensionType::RenegotiationInfo,
+    ExtensionType::EllipticCurves,
+    ExtensionType::ECPointFormats,
+    ExtensionType::SessionTicket,
+    ExtensionType::ALProtocolNegotiation,
+    ExtensionType::StatusRequest,
+    ExtensionType::DelegatedCredentials,
+    ExtensionType::SCT,
+    ExtensionType::KeyShare,
+    ExtensionType::SupportedVersions,
+    ExtensionType::SignatureAlgorithms,
+    ExtensionType::PSKKeyExchangeModes,
+    ExtensionType::RecordSizeLimit,
+    ExtensionType::CompressCertificate,
+];
 
-impl FirefoxShape {
-    /// Firefox's `cipherSuites[]`.  The four static-RSA and three CBC-SHA
-    /// entries are suites rustls cannot run; they are offered anyway, and a
-    /// server that selects one ends the handshake.
-    const CIPHER_SUITES: [CipherSuite; 16] = [
-        CipherSuite::TLS13_AES_128_GCM_SHA256,
-        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-        CipherSuite::TLS13_AES_256_GCM_SHA384,
-        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-        CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256,
-        CipherSuite::TLS_RSA_WITH_AES_256_GCM_SHA384,
-        CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
-        CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
-    ];
-
-    /// Firefox's `SSL_NamedGroupConfig`, whose last two entries are FFDHE
-    /// groups no built-in provider offers.
-    const NAMED_GROUPS: [NamedGroup; 7] = [
-        NamedGroup::X25519MLKEM768,
-        NamedGroup::X25519,
-        NamedGroup::secp256r1,
-        NamedGroup::secp384r1,
-        NamedGroup::secp521r1,
-        NamedGroup::FFDHE2048,
-        NamedGroup::FFDHE3072,
-    ];
-
-    /// Firefox's wire order for its first `ClientHello`, minus ECH GREASE
-    /// (0xfe0d): rustls emits that one in its position-mandated tail, which is
-    /// where Firefox puts it too, so anything the profile offers that is
-    /// missing here still lands at the end.  Taken from
-    /// `parsed-153.3.0esr.txt` (the `chsni` capture, so `server_name` leads).
-    const EXTENSION_ORDER: [ExtensionType; 16] = [
-        ExtensionType::ServerName,
-        ExtensionType::ExtendedMasterSecret,
-        ExtensionType::RenegotiationInfo,
-        ExtensionType::EllipticCurves,
-        ExtensionType::ECPointFormats,
-        ExtensionType::SessionTicket,
-        ExtensionType::ALProtocolNegotiation,
-        ExtensionType::StatusRequest,
-        ExtensionType::DelegatedCredentials,
-        ExtensionType::SCT,
-        ExtensionType::KeyShare,
-        ExtensionType::SupportedVersions,
-        ExtensionType::SignatureAlgorithms,
-        ExtensionType::PSKKeyExchangeModes,
-        ExtensionType::RecordSizeLimit,
-        ExtensionType::CompressCertificate,
-    ];
-
-    /// Firefox's `signature_algorithms`: 11 schemes, with no Ed25519.
-    const SIGNATURE_SCHEMES: [SignatureScheme; 11] = [
-        SignatureScheme::ECDSA_NISTP256_SHA256,
-        SignatureScheme::ECDSA_NISTP384_SHA384,
-        SignatureScheme::ECDSA_NISTP521_SHA512,
-        SignatureScheme::RSA_PSS_SHA256,
-        SignatureScheme::RSA_PSS_SHA384,
-        SignatureScheme::RSA_PSS_SHA512,
-        SignatureScheme::RSA_PKCS1_SHA256,
-        SignatureScheme::RSA_PKCS1_SHA384,
-        SignatureScheme::RSA_PKCS1_SHA512,
-        SignatureScheme::ECDSA_SHA1_Legacy,
-        SignatureScheme::RSA_PKCS1_SHA1,
-    ];
-
-    /// The extensions rustls has no implementation for, as Firefox states them.
-    const RAW_EXTENSIONS: [(ExtensionType, &[u8]); 5] = [
-        (ExtensionType::RenegotiationInfo, &[0x00]),
-        (ExtensionType::SessionTicket, &[]),
-        (
-            ExtensionType::DelegatedCredentials,
-            &[0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03],
-        ),
-        (ExtensionType::SCT, &[]),
-        (ExtensionType::RecordSizeLimit, &[0x40, 0x01]),
-    ];
-}
-
-impl ClientHelloProfile for FirefoxShape {
-    fn extension_order(&self, available: &[ExtensionType]) -> Option<Vec<ExtensionType>> {
-        let mut order: Vec<_> = Self::EXTENSION_ORDER
-            .iter()
-            .copied()
-            .filter(|typ| available.contains(typ))
-            .collect();
-        let extra: Vec<_> = available
-            .iter()
-            .copied()
-            .filter(|typ| !order.contains(typ))
-            .collect();
-        order.extend(extra);
-        Some(order)
-    }
-
-    fn cipher_suites(&self, _available: &[SupportedCipherSuite]) -> Option<Vec<CipherSuite>> {
-        Some(Self::CIPHER_SUITES.to_vec())
-    }
-
-    fn named_groups(&self, _available: &[NamedGroup]) -> Option<Vec<NamedGroup>> {
-        Some(Self::NAMED_GROUPS.to_vec())
-    }
-
-    fn key_share_groups(
-        &self,
-        _available: &[&'static dyn SupportedKxGroup],
-    ) -> Option<Vec<&'static dyn SupportedKxGroup>> {
-        Some(self.key_share_groups.clone())
-    }
-
-    fn signature_schemes(&self, _available: &[SignatureScheme]) -> Option<Vec<SignatureScheme>> {
-        Some(Self::SIGNATURE_SCHEMES.to_vec())
-    }
-
-    fn session_id(&self, client_random: &[u8; 32]) -> Option<[u8; 32]> {
-        Some(fake_sid(client_random))
-    }
-
-    fn raw_extensions(&self) -> Vec<(ExtensionType, Vec<u8>)> {
-        Self::RAW_EXTENSIONS
-            .iter()
-            .map(|(typ, body)| (*typ, body.to_vec()))
-            .collect()
-    }
-}
+/// Firefox ESR 153's `signature_algorithms`: 11 schemes, with no Ed25519.
+const FIREFOX_ESR153_SIGNATURE_SCHEMES: [SignatureScheme; 11] = [
+    SignatureScheme::ECDSA_NISTP256_SHA256,
+    SignatureScheme::ECDSA_NISTP384_SHA384,
+    SignatureScheme::ECDSA_NISTP521_SHA512,
+    SignatureScheme::RSA_PSS_SHA256,
+    SignatureScheme::RSA_PSS_SHA384,
+    SignatureScheme::RSA_PSS_SHA512,
+    SignatureScheme::RSA_PKCS1_SHA256,
+    SignatureScheme::RSA_PKCS1_SHA384,
+    SignatureScheme::RSA_PKCS1_SHA512,
+    SignatureScheme::ECDSA_SHA1_Legacy,
+    SignatureScheme::RSA_PKCS1_SHA1,
+];
 
 /// A group no provider offers, standing in for a profile that promises a key
 /// share it cannot start.
