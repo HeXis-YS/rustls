@@ -137,6 +137,8 @@ impl ClientHelloInput {
             }
         };
 
+        let random = Random::new(config.provider.secure_random)?;
+
         // https://tools.ietf.org/html/rfc8446#appendix-D.4
         // https://tools.ietf.org/html/draft-ietf-quic-tls-34#section-8.4
         let session_id = match session_id {
@@ -145,7 +147,16 @@ impl ClientHelloInput {
             None if !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) => {
                 SessionId::empty()
             }
-            None => SessionId::random(config.provider.secure_random)?,
+            // A profile may replace the compatibility session id, which is a
+            // function of the client random for at least one real client.
+            None => match config
+                .client_hello_profile
+                .as_ref()
+                .and_then(|profile| profile.session_id(&random.0))
+            {
+                Some(bytes) => SessionId::from_bytes(bytes),
+                None => SessionId::random(config.provider.secure_random)?,
+            },
         };
 
         let hello = ClientHelloDetails::new(
@@ -158,7 +169,7 @@ impl ClientHelloInput {
 
         Ok(Self {
             resuming,
-            random: Random::new(config.provider.secure_random)?,
+            random,
             sent_tls13_fake_ccs: false,
             hello,
             session_id,

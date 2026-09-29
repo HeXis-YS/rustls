@@ -173,6 +173,10 @@ impl SessionId {
         Ok(Self { data, len: 32 })
     }
 
+    pub(crate) fn from_bytes(data: [u8; 32]) -> Self {
+        Self { data, len: 32 }
+    }
+
     pub(crate) fn empty() -> Self {
         Self {
             data: [0u8; 32],

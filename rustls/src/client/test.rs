@@ -114,6 +114,41 @@ mod tests {
         assert!(order.len() > 3, "expected the offered set, got {order:?}");
     }
 
+    /// Firefox derives `legacy_session_id` from `ClientHello.random`
+    /// (`ssl_MakeFakeSid`) so the field costs no entropy and a passive observer
+    /// can recompute it.  A profile states that derivation; the point of the
+    /// test is that the random handed to the profile is the one that goes out.
+    #[test]
+    fn client_hello_profile_pins_session_id_from_client_random() {
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_profile = Some(Arc::new(FakeSid));
+
+        let (random, session_id) = client_hello_random_and_session_id(config).unwrap();
+        assert_eq!(session_id.len(), 32);
+        assert_eq!(&session_id[..], &fake_sid(&random)[..]);
+    }
+
+    /// Without a profile the field is still what rustls always made it: 32
+    /// random bytes on a fresh TLS 1.3 TCP handshake.
+    #[test]
+    fn session_id_defaults_to_random_bytes() {
+        let config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+
+        let (random, session_id) = client_hello_random_and_session_id(config).unwrap();
+        assert_eq!(session_id.len(), 32);
+        assert_ne!(&session_id[..], &fake_sid(&random)[..]);
+    }
+
     #[test]
     fn client_hello_profile_pins_cipher_suites_groups_and_key_shares() {
         // The three dimensions JA3 reads off.  The suite list deliberately
@@ -951,6 +986,45 @@ fn client_hello_extension_order(config: ClientConfig) -> Result<Vec<ExtensionTyp
     Ok(order)
 }
 
+/// The `ClientHello.random` and `legacy_session_id` as they appear on the wire.
+fn client_hello_random_and_session_id(config: ClientConfig) -> Result<([u8; 32], Vec<u8>), Error> {
+    let mut conn =
+        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
+    let mut bytes = Vec::new();
+    conn.write_tls(&mut bytes).unwrap();
+
+    let mut reader = Reader::init(&bytes);
+    let _ = reader.take(5).expect("record header");
+    let _ = reader
+        .take(4)
+        .expect("handshake header");
+    let _ = reader.take(2).expect("legacy version");
+    let random: [u8; 32] = reader
+        .take(32)
+        .expect("random")
+        .try_into()
+        .unwrap();
+
+    let session_id_len = usize::from(u8::read(&mut reader).expect("session id length"));
+    let session_id = reader
+        .take(session_id_len)
+        .expect("session id")
+        .to_vec();
+
+    Ok((random, session_id))
+}
+
+/// Firefox's `ssl_MakeFakeSid`: `out[i] = 0x5a + sum(random[0..=i])`.
+fn fake_sid(random: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut acc: u8 = 0;
+    for (o, r) in out.iter_mut().zip(random) {
+        acc = acc.wrapping_add(*r);
+        *o = 0x5a_u8.wrapping_add(acc);
+    }
+    out
+}
+
 /// Emits the offered extensions in reverse order, recording what it was offered.
 #[derive(Debug, Default)]
 struct ReverseExtensionOrder {
@@ -973,6 +1047,16 @@ struct BogusExtensionOrder;
 impl ClientHelloProfile for BogusExtensionOrder {
     fn extension_order(&self, _available: &[ExtensionType]) -> Option<Vec<ExtensionType>> {
         Some(vec![ExtensionType::Cookie])
+    }
+}
+
+/// Derives `legacy_session_id` from the client random, as Firefox does.
+#[derive(Debug)]
+struct FakeSid;
+
+impl ClientHelloProfile for FakeSid {
+    fn session_id(&self, client_random: &[u8; 32]) -> Option<[u8; 32]> {
+        Some(fake_sid(client_random))
     }
 }
 

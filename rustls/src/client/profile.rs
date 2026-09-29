@@ -85,4 +85,25 @@ pub trait ClientHelloProfile: fmt::Debug + Send + Sync {
         let _ = available;
         None
     }
+
+    /// Value to send as `legacy_session_id`, given the `ClientHello.random` that
+    /// goes out beside it.
+    ///
+    /// In TLS 1.3 this field carries no meaning; it is sent only so a middlebox
+    /// mistakes the handshake for one it understands (RFC 8446 appendix D.4).
+    /// rustls fills it with fresh random bytes, which makes it a non-constant
+    /// that is still, unlike every other field, unrelated to the rest of the
+    /// hello.  Firefox instead derives it from `ClientHello.random` itself
+    /// (`ssl_MakeFakeSid`), so a passive observer can recompute it and check
+    /// that no entropy was spent on it.
+    ///
+    /// Returning `Some` sends those 32 bytes verbatim.  It applies only where
+    /// rustls would otherwise generate a session id -- a fresh TLS 1.3
+    /// handshake over TCP.  QUIC keeps an empty session id (RFC 9001 section
+    /// 8.4) and a resumed TLS 1.2 session keeps the id it already chose, both
+    /// untouched.
+    fn session_id(&self, client_random: &[u8; 32]) -> Option<[u8; 32]> {
+        let _ = client_random;
+        None
+    }
 }
