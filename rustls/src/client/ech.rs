@@ -191,6 +191,7 @@ impl EchConfig {
 pub struct EchGreaseConfig {
     pub(crate) suite: &'static dyn Hpke,
     pub(crate) placeholder_key: HpkePublicKey,
+    pub(crate) payload_len: Option<usize>,
 }
 
 impl EchGreaseConfig {
@@ -207,7 +208,26 @@ impl EchGreaseConfig {
         Self {
             suite,
             placeholder_key,
+            payload_len: None,
         }
+    }
+
+    /// Pin the size of the GREASE payload instead of deriving it from the
+    /// ClientHello.
+    ///
+    /// A GREASE extension is never decrypted, so its payload only has to pass
+    /// for the ciphertext of some inner ClientHello.  rustls sizes the dummy
+    /// payload from the outer ClientHello it is about to send, which makes the
+    /// extension as large as a real inner hello.  A client that instead sends
+    /// one fixed size -- Firefox pads its inner hello to a constant length --
+    /// is reproduced by pinning it here.
+    ///
+    /// The value is the length of the `payload` field.  For example, Firefox
+    /// 153 sends an inner hello padded to 223 bytes, plus the AEAD tag, so its
+    /// payload is 239 bytes and the extension body is 281.
+    pub fn with_payload_len(mut self, len: usize) -> Self {
+        self.payload_len = Some(len);
+        self
     }
 
     /// Build a GREASE ECH extension based on the placeholder configuration.
@@ -251,19 +271,33 @@ impl EchGreaseConfig {
             false, // Does not matter if we enable/disable SNI here. Inner hello is not used.
         )?;
 
-        // Construct an inner hello using the outer hello - this allows us to know the size of
-        // dummy payload we should use for the GREASE extension.
-        let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None);
+        let payload_len = match self.payload_len {
+            Some(len) => len,
+            None => {
+                // Construct an inner hello using the outer hello - this allows us to know the
+                // size of dummy payload we should use for the GREASE extension.
+                let encoded_inner_hello = grease_state.encode_inner_hello(outer_hello, None, &None);
 
-        // Generate a payload of random data equivalent in length to a real inner hello.
-        let payload_len = encoded_inner_hello.len()
-            + suite
-                .sym
-                .aead_id
-                .tag_len()
-                // Safety: we have confirmed the AEAD is supported when building the config. All
-                //  supported AEADs have a tag length.
-                .unwrap();
+                encoded_inner_hello.len()
+                    + suite
+                        .sym
+                        .aead_id
+                        .tag_len()
+                        // Safety: we have confirmed the AEAD is supported when building the
+                        // config. All supported AEADs have a tag length.
+                        .unwrap()
+            }
+        };
+
+        // `payload` is a non-empty vector on the wire; a zero length would
+        // encode an extension no peer can parse.
+        if payload_len == 0 {
+            return Err(Error::General(
+                "a GREASE ECH payload must be at least one byte".into(),
+            ));
+        }
+
+        // Generate a payload of random data of the expected length.
         let mut payload = vec![0; payload_len];
         secure_random.fill(&mut payload)?;
 

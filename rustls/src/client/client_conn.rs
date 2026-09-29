@@ -11,7 +11,7 @@ use super::profile::ClientHelloProfile;
 #[cfg(feature = "std")]
 use crate::WantsVerifier;
 use crate::builder::ConfigBuilder;
-use crate::client::{EchMode, EchStatus};
+use crate::client::{EchGreaseConfig, EchMode, EchStatus};
 use crate::common_state::{CommonState, Protocol, Side};
 use crate::conn::{ConnectionCore, UnbufferedConnectionCommon};
 use crate::crypto::{CryptoProvider, SupportedKxGroup};
@@ -417,6 +417,20 @@ impl ClientConfig {
     /// Return the crypto provider used to construct this client configuration.
     pub fn crypto_provider(&self) -> &Arc<CryptoProvider> {
         &self.provider
+    }
+
+    /// Enable a GREASE EncryptedClientHello extension.
+    ///
+    /// The extension is not an offer of ECH: the server is expected to ignore
+    /// it, rustls does not encrypt an inner hello, and no ECH configuration is
+    /// needed.  Unlike [`ConfigBuilder::with_ech`], which selects TLS 1.3 as
+    /// the only version to offer because ECH requires it, this leaves the
+    /// configured versions alone -- a GREASE extension may ride along with
+    /// TLS 1.2, as it does in real clients.
+    ///
+    /// [`ConfigBuilder::with_ech`]: crate::ConfigBuilder::with_ech
+    pub fn set_ech_grease(&mut self, config: EchGreaseConfig) {
+        self.ech_mode = Some(EchMode::Grease(config));
     }
 
     /// Access configuration options whose use is dangerous and requires

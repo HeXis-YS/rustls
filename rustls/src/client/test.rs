@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 use pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::client::{
-    ClientConfig, ClientConnection, ClientHelloProfile, Resumption, Tls12Resumption,
+    ClientConfig, ClientConnection, ClientHelloProfile, EchGreaseConfig, EchMode, Resumption,
+    Tls12Resumption,
 };
 use crate::crypto::{ActiveKeyExchange, CryptoProvider, SupportedKxGroup};
 use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
@@ -180,14 +181,16 @@ mod tests {
     }
 
     /// The whole Firefox ESR 153 shape, assembled from the capture: extension
-    /// set and order, cipher suites, groups, key shares, session id, and the
-    /// extensions rustls does not implement.  What is left over is the ECH
-    /// GREASE body -- and certificate compression, when the decompressor
-    /// features it needs are compiled out.
+    /// set and order, cipher suites, groups, key shares, session id, the
+    /// extensions rustls does not implement, and a GREASE ECH extension of
+    /// Firefox's constant size.  Certificate compression drops out when the
+    /// decompressor features it needs are compiled out.
     #[cfg(feature = "aws_lc_rs")]
     #[test]
     fn client_hello_profile_reproduces_firefox_esr153_shape() {
+        use crate::crypto::aws_lc_rs::hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
         use crate::crypto::aws_lc_rs::kx_group::{SECP256R1, X25519, X25519MLKEM768};
+        use crate::crypto::hpke::Hpke;
 
         let mlkem: &'static dyn SupportedKxGroup = X25519MLKEM768;
         let x25519: &'static dyn SupportedKxGroup = X25519;
@@ -204,6 +207,15 @@ mod tests {
         config.client_hello_profile = Some(Arc::new(FirefoxShape {
             key_share_groups: vec![mlkem, x25519, p256],
         }));
+        // Firefox pads its inner hello to a constant size, so the GREASE ECH
+        // extension is the same length in every ClientHello it sends.
+        let (placeholder_key, _) = DH_KEM_X25519_HKDF_SHA256_AES_128
+            .generate_key_pair()
+            .unwrap();
+        config.set_ech_grease(
+            EchGreaseConfig::new(DH_KEM_X25519_HKDF_SHA256_AES_128, placeholder_key)
+                .with_payload_len(239),
+        );
         let for_record_len = config.clone();
 
         let compression = !config.cert_decompressors.is_empty();
@@ -217,6 +229,7 @@ mod tests {
             .iter()
             .copied()
             .filter(|typ| *typ != ExtensionType::CompressCertificate || compression)
+            .chain([ExtensionType::EncryptedClientHello])
             .collect();
         assert_eq!(
             types, expected,
@@ -249,6 +262,9 @@ mod tests {
         assert_eq!(body(ExtensionType::SignatureAlgorithms).len(), 24);
         assert_eq!(body(ExtensionType::PSKKeyExchangeModes).len(), 2);
         assert_eq!(body(ExtensionType::RecordSizeLimit), vec![0x40, 0x01]);
+        // Firefox pads the inner hello of its GREASE ECH to a constant size, so
+        // this extension is the same length in every ClientHello it sends.
+        assert_eq!(body(ExtensionType::EncryptedClientHello).len(), 281);
         if compression {
             // Firefox states zlib, brotli and zstd (7 bytes); this fork has no
             // zstd decompressor, so it states only the first two.
@@ -263,16 +279,55 @@ mod tests {
         std::println!("extension bytes: {bytes}");
 
         // Firefox's first `ClientHello` is 1899 B on the wire (`README.md`,
-        // size table).  With the profile on, ours is that minus exactly the
-        // three differences left: the ECH GREASE extension (285 B), the
-        // shorter name this test asks for (7 B), and Firefox's third
-        // decompressor (2 B; the whole 11 B extension is missing when the
-        // features are compiled out).
+        // size table).  With the profile on, ours is that minus exactly the two
+        // differences left: the shorter name this test asks for (7 B) and
+        // Firefox's third decompressor (2 B; the whole 11 B extension is
+        // missing when the features are compiled out).
         let record_len = client_hello_record_len(for_record_len).unwrap();
         let sni_delta = 21 - (5 + "localhost".len());
         let compression_delta = if compression { 2 } else { 11 };
         std::println!("record bytes: {record_len}");
-        assert_eq!(record_len + 285 + sni_delta + compression_delta, 1899);
+        assert_eq!(record_len + sni_delta + compression_delta, 1899);
+    }
+
+    /// Firefox sends a GREASE ECH extension of one constant size (281 B body /
+    /// 285 B on the wire for 153, per `parsed-153.3.0esr.txt`).  Both halves of
+    /// that matter for a shape: the extension is in the list JA3/JA4 read, and
+    /// its length does not vary with the rest of the ClientHello the way
+    /// rustls' own sizing of the dummy payload does.
+    #[cfg(feature = "aws_lc_rs")]
+    #[test]
+    fn grease_ech_payload_can_be_pinned() {
+        use crate::crypto::aws_lc_rs::hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
+        use crate::crypto::hpke::Hpke;
+
+        let (placeholder_key, _) = DH_KEM_X25519_HKDF_SHA256_AES_128
+            .generate_key_pair()
+            .unwrap();
+        let grease = EchGreaseConfig::new(DH_KEM_X25519_HKDF_SHA256_AES_128, placeholder_key)
+            .with_payload_len(239);
+
+        let config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_ech(EchMode::Grease(grease))
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        let exts = client_hello_extensions(config).unwrap();
+        let body = exts
+            .iter()
+            .find(|(typ, _)| *typ == ExtensionType::EncryptedClientHello)
+            .expect("no ECH extension")
+            .1
+            .clone();
+
+        // outer(1) + cipher suite(4) + config_id(1) + enc(2 + 32) + payload(2 + 239)
+        assert_eq!(body.len(), 281);
+        assert_eq!(body[0], 0x00, "client hello outer");
+        assert_eq!(&body[1..3], &[0x00, 0x01], "HKDF-SHA256");
+        assert_eq!(&body[3..5], &[0x00, 0x01], "AES-128-GCM");
+        assert_eq!(&body[6..8], &[0x00, 0x20], "32-byte X25519 encapsulation");
+        assert_eq!(&body[40..42], &[0x00, 0xef], "239-byte payload");
     }
 
     /// Firefox derives `legacy_session_id` from `ClientHello.random`
@@ -1338,10 +1393,10 @@ impl FirefoxShape {
     ];
 
     /// Firefox's wire order for its first `ClientHello`, minus ECH GREASE
-    /// (0xfe0d), which we do not send yet and Firefox puts last -- so anything
-    /// the profile offers that is missing here still lands at the end.  Taken
-    /// from `parsed-153.3.0esr.txt` (the `chsni` capture, so `server_name`
-    /// leads).
+    /// (0xfe0d): rustls emits that one in its position-mandated tail, which is
+    /// where Firefox puts it too, so anything the profile offers that is
+    /// missing here still lands at the end.  Taken from
+    /// `parsed-153.3.0esr.txt` (the `chsni` capture, so `server_name` leads).
     const EXTENSION_ORDER: [ExtensionType; 16] = [
         ExtensionType::ServerName,
         ExtensionType::ExtendedMasterSecret,
