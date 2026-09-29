@@ -586,6 +586,7 @@ pub mod client {
     mod ech;
     pub(super) mod handy;
     mod hs;
+    mod profile;
     #[cfg(test)]
     mod test;
     #[cfg(feature = "tls12")]
@@ -603,6 +604,7 @@ pub mod client {
     pub use handy::AlwaysResolvesClientRawPublicKeys;
     #[cfg(any(feature = "std", feature = "hashbrown"))]
     pub use handy::ClientSessionMemoryCache;
+    pub use profile::ClientHelloProfile;
 
     /// Dangerous configuration that should be audited and used with extreme care.
     pub mod danger {

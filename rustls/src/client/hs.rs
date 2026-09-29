@@ -378,6 +378,29 @@ fn emit_client_hello_for_retry(
     // but they also need to keep the same order as the previous ClientHello
     exts.order_seed = input.hello.extension_order_seed;
 
+    // A profile may pin the order of the extensions rustls would otherwise hash
+    // into place.  `contiguous_extensions` is emitted verbatim between that
+    // hashed set and the position-mandated ECH/PSK tail, so storing a full
+    // permutation there fixes the emitted order without disturbing the rest.
+    if let Some(profile) = config.client_hello_profile.as_ref() {
+        let available = exts.order_insensitive_extensions_in_random_order();
+        match profile.extension_order(&available) {
+            Some(order) if is_permutation(&order, &available) => {
+                let mut order = order;
+                let remaining: Vec<_> = exts
+                    .contiguous_extensions
+                    .iter()
+                    .filter(|ext| !order.contains(ext))
+                    .copied()
+                    .collect();
+                order.extend(remaining);
+                exts.contiguous_extensions = order;
+            }
+            Some(_) => debug!("client hello profile returned a non-permutation; ignoring"),
+            None => {}
+        }
+    }
+
     let mut cipher_suites: Vec<_> = config
         .provider
         .cipher_suites
@@ -551,6 +574,28 @@ fn emit_client_hello_for_retry(
 ///
 /// This function will push onto `exts` to
 ///
+/// Whether `candidate` is a permutation of `expected`.
+fn is_permutation(candidate: &[ExtensionType], expected: &[ExtensionType]) -> bool {
+    if candidate.len() != expected.len() {
+        return false;
+    }
+
+    let mut remaining = expected.to_vec();
+    candidate.iter().all(|item| {
+        matching_position(&remaining, item)
+            .map(|pos| {
+                remaining.swap_remove(pos);
+            })
+            .is_some()
+    })
+}
+
+fn matching_position(haystack: &[ExtensionType], needle: &ExtensionType) -> Option<usize> {
+    haystack
+        .iter()
+        .position(|item| item == needle)
+}
+
 /// (a) request a new ticket if we don't have one,
 /// (b) send our TLS 1.2 ticket after retrieving an 1.2 session,
 /// (c) send a request for 1.3 early data if allowed and

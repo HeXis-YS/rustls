@@ -7,6 +7,7 @@ use pki_types::{ServerName, UnixTime};
 
 use super::handy::NoClientSessionStorage;
 use super::hs::{self, ClientHelloInput};
+use super::profile::ClientHelloProfile;
 #[cfg(feature = "std")]
 use crate::WantsVerifier;
 use crate::builder::ConfigBuilder;
@@ -287,6 +288,11 @@ pub struct ClientConfig {
 
     /// How to offer Encrypted Client Hello (ECH). The default is to not offer ECH.
     pub(super) ech_mode: Option<EchMode>,
+
+    /// Overrides for the shape of the `ClientHello` we emit.
+    ///
+    /// The default is `None`, which leaves rustls's own behaviour in place.
+    pub client_hello_profile: Option<Arc<dyn ClientHelloProfile>>,
 
     /// Request a specific number of TLS 1.3 session tickets via [RFC 9149].
     ///

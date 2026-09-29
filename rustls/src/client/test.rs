@@ -4,14 +4,18 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use std::sync::OnceLock;
+
 use pki_types::{CertificateDer, ServerName};
 
-use crate::client::{ClientConfig, ClientConnection, Resumption, Tls12Resumption};
+use crate::client::{
+    ClientConfig, ClientConnection, ClientHelloProfile, Resumption, Tls12Resumption,
+};
 use crate::crypto::CryptoProvider;
 use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::msgs::base::PayloadU16;
-use crate::msgs::codec::Reader;
-use crate::msgs::enums::{Compression, NamedGroup};
+use crate::msgs::codec::{Codec, Reader};
+use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
     ClientHelloPayload, HandshakeMessagePayload, HandshakePayload, HelloRetryRequest, Random,
     ServerHelloPayload, SessionId,
@@ -58,6 +62,56 @@ mod tests {
             .tls12_resumption(Tls12Resumption::SessionIdOrTickets);
         let ch = client_hello_sent_for_config(config).unwrap();
         assert!(ch.extensions.session_ticket.is_none());
+    }
+
+    #[test]
+    fn client_hello_profile_pins_extension_order() {
+        let profile = Arc::new(ReverseExtensionOrder::default());
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_profile = Some(profile.clone());
+
+        let order = client_hello_extension_order(config).unwrap();
+        let offered = profile
+            .offered
+            .get()
+            .expect("profile was consulted");
+        assert!(
+            offered.len() > 3,
+            "expected several mutable extensions, got {offered:?}"
+        );
+
+        // Extensions rustls must keep in a fixed position (eg. the ECH and PSK
+        // tail) are not part of the profile's input and follow it untouched.
+        let mut expected: Vec<_> = offered.iter().rev().copied().collect();
+        expected.extend(
+            order
+                .iter()
+                .copied()
+                .filter(|ext| !offered.contains(ext)),
+        );
+
+        assert_eq!(order, expected);
+    }
+
+    #[test]
+    fn client_hello_profile_rejects_non_permutation() {
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_profile = Some(Arc::new(BogusExtensionOrder));
+
+        let order = client_hello_extension_order(config).unwrap();
+
+        assert_ne!(order, vec![ExtensionType::Cookie]);
+        assert!(order.len() > 3, "expected the offered set, got {order:?}");
     }
 
     #[test]
@@ -700,6 +754,76 @@ fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPaylo
             ..
         } => Ok(ch),
         other => panic!("unexpected message {other:?}"),
+    }
+}
+
+/// The order in which the extensions appeared on the wire.
+fn client_hello_extension_order(config: ClientConfig) -> Result<Vec<ExtensionType>, Error> {
+    let mut conn =
+        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
+    let mut bytes = Vec::new();
+    conn.write_tls(&mut bytes).unwrap();
+
+    let mut reader = Reader::init(&bytes);
+    let _ = reader.take(5).expect("record header");
+    let _ = reader
+        .take(4)
+        .expect("handshake header");
+    let _ = reader.take(2).expect("legacy version");
+    let _ = reader.take(32).expect("random");
+
+    let session_id_len = usize::from(u8::read(&mut reader).expect("session id length"));
+    let _ = reader
+        .take(session_id_len)
+        .expect("session id");
+    let cipher_suites_len = usize::from(u16::read(&mut reader).expect("cipher suite length"));
+    let _ = reader
+        .take(cipher_suites_len)
+        .expect("cipher suites");
+    let compression_len = usize::from(u8::read(&mut reader).expect("compression length"));
+    let _ = reader
+        .take(compression_len)
+        .expect("compressions");
+
+    let extensions_len = usize::from(u16::read(&mut reader).expect("extensions length"));
+    let mut extensions = reader
+        .sub(extensions_len)
+        .expect("extensions");
+
+    let mut order = Vec::new();
+    while extensions.any_left() {
+        order.push(ExtensionType::read(&mut extensions).expect("extension type"));
+        let length = usize::from(u16::read(&mut extensions).expect("extension length"));
+        let _ = extensions
+            .take(length)
+            .expect("extension body");
+    }
+
+    Ok(order)
+}
+
+/// Emits the offered extensions in reverse order, recording what it was offered.
+#[derive(Debug, Default)]
+struct ReverseExtensionOrder {
+    offered: OnceLock<Vec<ExtensionType>>,
+}
+
+impl ClientHelloProfile for ReverseExtensionOrder {
+    fn extension_order(&self, available: &[ExtensionType]) -> Option<Vec<ExtensionType>> {
+        let _ = self.offered.set(available.to_vec());
+        let mut order = available.to_vec();
+        order.reverse();
+        Some(order)
+    }
+}
+
+/// Returns an order that is not a permutation of what it was offered.
+#[derive(Debug)]
+struct BogusExtensionOrder;
+
+impl ClientHelloProfile for BogusExtensionOrder {
+    fn extension_order(&self, _available: &[ExtensionType]) -> Option<Vec<ExtensionType>> {
+        Some(vec![ExtensionType::Cookie])
     }
 }
 

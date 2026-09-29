@@ -1073,7 +1073,7 @@ impl ClientExtensions<'_> {
     ///
     /// - Lastly, any ECH and PSK extensions (in that order).  These
     ///   are required to be last by the standard.
-    fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
+    pub(crate) fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
         let mut order = self.collect_used();
 
         // Remove extensions which have specific order requirements.
