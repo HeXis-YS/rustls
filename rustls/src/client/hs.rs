@@ -278,14 +278,21 @@ fn emit_client_hello_for_retry(
                 .collect()
         });
 
+    // The signature schemes are a declaration: rustls checks the server's
+    // certificate and its `CertificateVerify` signature with the verifier's
+    // own list, so a profile can replace the offer without touching what is
+    // accepted.
+    let verifier_schemes = config
+        .verifier
+        .supported_verify_schemes();
+    let signature_schemes = profile
+        .and_then(|profile| profile.signature_schemes(&verifier_schemes))
+        .unwrap_or(verifier_schemes);
+
     let mut exts = Box::new(ClientExtensions {
         named_groups: Some(named_groups),
         supported_versions: Some(supported_versions),
-        signature_schemes: Some(
-            config
-                .verifier
-                .supported_verify_schemes(),
-        ),
+        signature_schemes: Some(signature_schemes),
         extended_master_secret_request: Some(()),
         certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
         protocols: extra_exts.protocols.clone(),

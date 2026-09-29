@@ -16,7 +16,7 @@ use core::fmt;
 
 use crate::NamedGroup;
 use crate::crypto::SupportedKxGroup;
-use crate::enums::CipherSuite;
+use crate::enums::{CipherSuite, SignatureScheme};
 use crate::msgs::enums::ExtensionType;
 use crate::suites::SupportedCipherSuite;
 
@@ -62,6 +62,18 @@ pub trait ClientHelloProfile: fmt::Debug + Send + Sync {
     /// and may name groups rustls cannot use.  A server that asks to use one of
     /// those (with a `HelloRetryRequest`) ends the handshake.
     fn named_groups(&self, available: &[NamedGroup]) -> Option<Vec<NamedGroup>> {
+        let _ = available;
+        None
+    }
+
+    /// Signature schemes to offer, in the order they appear on the wire.
+    ///
+    /// `available` is what the certificate verifier states, which is what
+    /// rustls would otherwise offer.  The returned list replaces that offer.
+    /// It is a declaration only: it may name schemes rustls cannot check and
+    /// may omit ones it can, because the verifier -- not this list -- decides
+    /// what rustls accepts from the server.
+    fn signature_schemes(&self, available: &[SignatureScheme]) -> Option<Vec<SignatureScheme>> {
         let _ = available;
         None
     }

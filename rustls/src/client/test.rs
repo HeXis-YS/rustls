@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use std::sync::OnceLock;
 
-use pki_types::{CertificateDer, ServerName, UnixTime};
+use pki_types::{CertificateDer, ServerName};
 
 use crate::client::{
     ClientConfig, ClientConnection, ClientHelloProfile, EchGreaseConfig, EchMode, Resumption,
@@ -23,11 +23,7 @@ use crate::msgs::handshake::{
 };
 use crate::msgs::message::{Message, MessagePayload, OutboundOpaqueMessage};
 use crate::sync::Arc;
-use crate::verify::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use crate::{
-    DigitallySignedStruct, Error, PeerIncompatible, PeerMisbehaved, RootCertStore,
-    SupportedCipherSuite,
-};
+use crate::{Error, PeerIncompatible, PeerMisbehaved, RootCertStore, SupportedCipherSuite};
 
 #[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
@@ -180,6 +176,50 @@ mod tests {
         }
     }
 
+    /// `signature_algorithms` is the one extension whose content comes from
+    /// somewhere other than the hello itself: rustls takes it from the
+    /// certificate verifier.  A profile states its own list, and what the
+    /// verifier would have said does not leak into the offer.
+    #[test]
+    fn client_hello_profile_pins_signature_schemes() {
+        let profile = Arc::new(SignatureSchemes::default());
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_profile = Some(profile.clone());
+
+        let exts = client_hello_extensions(config).unwrap();
+        let body = exts
+            .iter()
+            .find(|(typ, _)| *typ == ExtensionType::SignatureAlgorithms)
+            .expect("no signature_algorithms extension")
+            .1
+            .clone();
+
+        // Two-byte list length, then one `u16` per scheme.
+        assert_eq!(body.len(), 2 + 2 * FirefoxShape::SIGNATURE_SCHEMES.len());
+        let mut expected = Vec::new();
+        for scheme in FirefoxShape::SIGNATURE_SCHEMES {
+            expected.extend_from_slice(&u16::from(scheme).to_be_bytes());
+        }
+        assert_eq!(body[2..], expected[..]);
+
+        // The verifier's list is what would have gone out without the profile.
+        // It differs from Firefox's -- no provider states Firefox's exact
+        // list -- so the override is observable here.
+        let offered = profile
+            .offered
+            .get()
+            .expect("profile was consulted");
+        assert!(
+            *offered != FirefoxShape::SIGNATURE_SCHEMES,
+            "nothing to override: {offered:?}"
+        );
+    }
+
     /// The whole Firefox ESR 153 shape, assembled from the capture: extension
     /// set and order, cipher suites, groups, key shares, session id, the
     /// extensions rustls does not implement, and a GREASE ECH extension of
@@ -203,7 +243,6 @@ mod tests {
                 .with_root_certificates(roots())
                 .with_no_client_auth();
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        config.verifier = Arc::new(FirefoxVerifier);
         config.client_hello_profile = Some(Arc::new(FirefoxShape {
             key_share_groups: vec![mlkem, x25519, p256],
         }));
@@ -1319,6 +1358,20 @@ impl ClientHelloProfile for BogusExtensionOrder {
     }
 }
 
+/// States Firefox's `signature_algorithms`, recording the verifier's list it
+/// replaces.
+#[derive(Debug, Default)]
+struct SignatureSchemes {
+    offered: OnceLock<Vec<SignatureScheme>>,
+}
+
+impl ClientHelloProfile for SignatureSchemes {
+    fn signature_schemes(&self, available: &[SignatureScheme]) -> Option<Vec<SignatureScheme>> {
+        let _ = self.offered.set(available.to_vec());
+        Some(FirefoxShape::SIGNATURE_SCHEMES.to_vec())
+    }
+}
+
 /// Derives `legacy_session_id` from the client random, as Firefox does.
 #[derive(Debug)]
 struct FakeSid;
@@ -1475,6 +1528,10 @@ impl ClientHelloProfile for FirefoxShape {
         Some(self.key_share_groups.clone())
     }
 
+    fn signature_schemes(&self, _available: &[SignatureScheme]) -> Option<Vec<SignatureScheme>> {
+        Some(Self::SIGNATURE_SCHEMES.to_vec())
+    }
+
     fn session_id(&self, client_random: &[u8; 32]) -> Option<[u8; 32]> {
         Some(fake_sid(client_random))
     }
@@ -1484,49 +1541,6 @@ impl ClientHelloProfile for FirefoxShape {
             .iter()
             .map(|(typ, body)| (*typ, body.to_vec()))
             .collect()
-    }
-}
-
-/// States Firefox's `signature_algorithms`, which is where that extension comes
-/// from: rustls takes the list from the verifier.
-#[derive(Debug)]
-struct FirefoxVerifier;
-
-impl ServerCertVerifier for FirefoxVerifier {
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, Error> {
-        unreachable!()
-    }
-
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        unreachable!()
-    }
-
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        unreachable!()
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        FirefoxShape::SIGNATURE_SCHEMES.to_vec()
     }
 }
 
