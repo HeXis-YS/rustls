@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use std::sync::OnceLock;
 
-use pki_types::{CertificateDer, ServerName};
+use pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::client::{
     ClientConfig, ClientConnection, ClientHelloProfile, Resumption, Tls12Resumption,
@@ -22,7 +22,11 @@ use crate::msgs::handshake::{
 };
 use crate::msgs::message::{Message, MessagePayload, OutboundOpaqueMessage};
 use crate::sync::Arc;
-use crate::{Error, PeerIncompatible, PeerMisbehaved, RootCertStore, SupportedCipherSuite};
+use crate::verify::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use crate::{
+    DigitallySignedStruct, Error, PeerIncompatible, PeerMisbehaved, RootCertStore,
+    SupportedCipherSuite,
+};
 
 #[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
@@ -173,6 +177,102 @@ mod tests {
         ] {
             assert!(offered.contains(&typ), "{typ:?} missing from {offered:?}");
         }
+    }
+
+    /// The whole Firefox ESR 153 shape, assembled from the capture: extension
+    /// set and order, cipher suites, groups, key shares, session id, and the
+    /// extensions rustls does not implement.  What is left over is the ECH
+    /// GREASE body -- and certificate compression, when the decompressor
+    /// features it needs are compiled out.
+    #[cfg(feature = "aws_lc_rs")]
+    #[test]
+    fn client_hello_profile_reproduces_firefox_esr153_shape() {
+        use crate::crypto::aws_lc_rs::kx_group::{SECP256R1, X25519, X25519MLKEM768};
+
+        let mlkem: &'static dyn SupportedKxGroup = X25519MLKEM768;
+        let x25519: &'static dyn SupportedKxGroup = X25519;
+        let p256: &'static dyn SupportedKxGroup = SECP256R1;
+
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.verifier = Arc::new(FirefoxVerifier);
+        config.client_hello_profile = Some(Arc::new(FirefoxShape {
+            key_share_groups: vec![mlkem, x25519, p256],
+        }));
+        let for_record_len = config.clone();
+
+        let compression = !config.cert_decompressors.is_empty();
+        let exts = client_hello_extensions(config).unwrap();
+        let types: Vec<_> = exts
+            .iter()
+            .map(|(typ, _)| *typ)
+            .collect();
+
+        let expected: Vec<_> = FirefoxShape::EXTENSION_ORDER
+            .iter()
+            .copied()
+            .filter(|typ| *typ != ExtensionType::CompressCertificate || compression)
+            .collect();
+        assert_eq!(
+            types, expected,
+            "extension set or order differs from Firefox"
+        );
+
+        let body = |typ| {
+            exts.iter()
+                .find(|(seen, _)| *seen == typ)
+                .unwrap_or_else(|| panic!("{typ:?} missing"))
+                .1
+                .clone()
+        };
+        // Body lengths and values, as `parsed-153.3.0esr.txt` reports them.
+        assert_eq!(body(ExtensionType::ServerName).len(), 5 + "localhost".len());
+        assert!(body(ExtensionType::ExtendedMasterSecret).is_empty());
+        assert_eq!(body(ExtensionType::RenegotiationInfo), vec![0x00]);
+        assert_eq!(body(ExtensionType::EllipticCurves).len(), 16);
+        assert_eq!(body(ExtensionType::ECPointFormats).len(), 2);
+        assert!(body(ExtensionType::SessionTicket).is_empty());
+        assert_eq!(body(ExtensionType::ALProtocolNegotiation).len(), 14);
+        assert_eq!(body(ExtensionType::StatusRequest).len(), 5);
+        assert_eq!(
+            body(ExtensionType::DelegatedCredentials),
+            vec![0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03]
+        );
+        assert!(body(ExtensionType::SCT).is_empty());
+        assert_eq!(body(ExtensionType::KeyShare).len(), 1327);
+        assert_eq!(body(ExtensionType::SupportedVersions).len(), 5);
+        assert_eq!(body(ExtensionType::SignatureAlgorithms).len(), 24);
+        assert_eq!(body(ExtensionType::PSKKeyExchangeModes).len(), 2);
+        assert_eq!(body(ExtensionType::RecordSizeLimit), vec![0x40, 0x01]);
+        if compression {
+            // Firefox states zlib, brotli and zstd (7 bytes); this fork has no
+            // zstd decompressor, so it states only the first two.
+            assert_eq!(body(ExtensionType::CompressCertificate).len(), 5);
+        }
+
+        let bytes: usize = types
+            .iter()
+            .map(|typ| 4 + body(*typ).len())
+            .sum();
+        std::println!("firefox-shaped extensions: {types:?}");
+        std::println!("extension bytes: {bytes}");
+
+        // Firefox's first `ClientHello` is 1899 B on the wire (`README.md`,
+        // size table).  With the profile on, ours is that minus exactly the
+        // three differences left: the ECH GREASE extension (285 B), the
+        // shorter name this test asks for (7 B), and Firefox's third
+        // decompressor (2 B; the whole 11 B extension is missing when the
+        // features are compiled out).
+        let record_len = client_hello_record_len(for_record_len).unwrap();
+        let sni_delta = 21 - (5 + "localhost".len());
+        let compression_delta = if compression { 2 } else { 11 };
+        std::println!("record bytes: {record_len}");
+        assert_eq!(record_len + 285 + sni_delta + compression_delta, 1899);
     }
 
     /// Firefox derives `legacy_session_id` from `ClientHello.random`
@@ -979,6 +1079,15 @@ fn hybrid_kx_component_share_not_offered_unless_supported_separately() {
     assert_eq!(key_shares[0].group, NamedGroup::X25519MLKEM768);
 }
 
+/// The wire length of the `ClientHello` record rustls is about to send.
+fn client_hello_record_len(config: ClientConfig) -> Result<usize, Error> {
+    let mut conn =
+        ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
+    let mut bytes = Vec::new();
+    conn.write_tls(&mut bytes).unwrap();
+    Ok(bytes.len())
+}
+
 fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPayload, Error> {
     let mut conn =
         ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap())?;
@@ -1185,7 +1294,9 @@ impl ClientHelloProfile for RawExtensions {
     }
 }
 
-/// Pins all three dimensions JA3 reads off, using Firefox ESR 153's values.
+/// Firefox ESR 153's `ClientHello`, pinned dimension by dimension from the
+/// capture.  Without a profile rustls states its own shape; with this one the
+/// offer is Firefox's, down to the order of the extensions.
 #[derive(Debug)]
 struct FirefoxShape {
     key_share_groups: Vec<&'static dyn SupportedKxGroup>,
@@ -1225,9 +1336,75 @@ impl FirefoxShape {
         NamedGroup::FFDHE2048,
         NamedGroup::FFDHE3072,
     ];
+
+    /// Firefox's wire order for its first `ClientHello`, minus ECH GREASE
+    /// (0xfe0d), which we do not send yet and Firefox puts last -- so anything
+    /// the profile offers that is missing here still lands at the end.  Taken
+    /// from `parsed-153.3.0esr.txt` (the `chsni` capture, so `server_name`
+    /// leads).
+    const EXTENSION_ORDER: [ExtensionType; 16] = [
+        ExtensionType::ServerName,
+        ExtensionType::ExtendedMasterSecret,
+        ExtensionType::RenegotiationInfo,
+        ExtensionType::EllipticCurves,
+        ExtensionType::ECPointFormats,
+        ExtensionType::SessionTicket,
+        ExtensionType::ALProtocolNegotiation,
+        ExtensionType::StatusRequest,
+        ExtensionType::DelegatedCredentials,
+        ExtensionType::SCT,
+        ExtensionType::KeyShare,
+        ExtensionType::SupportedVersions,
+        ExtensionType::SignatureAlgorithms,
+        ExtensionType::PSKKeyExchangeModes,
+        ExtensionType::RecordSizeLimit,
+        ExtensionType::CompressCertificate,
+    ];
+
+    /// Firefox's `signature_algorithms`: 11 schemes, with no Ed25519.
+    const SIGNATURE_SCHEMES: [SignatureScheme; 11] = [
+        SignatureScheme::ECDSA_NISTP256_SHA256,
+        SignatureScheme::ECDSA_NISTP384_SHA384,
+        SignatureScheme::ECDSA_NISTP521_SHA512,
+        SignatureScheme::RSA_PSS_SHA256,
+        SignatureScheme::RSA_PSS_SHA384,
+        SignatureScheme::RSA_PSS_SHA512,
+        SignatureScheme::RSA_PKCS1_SHA256,
+        SignatureScheme::RSA_PKCS1_SHA384,
+        SignatureScheme::RSA_PKCS1_SHA512,
+        SignatureScheme::ECDSA_SHA1_Legacy,
+        SignatureScheme::RSA_PKCS1_SHA1,
+    ];
+
+    /// The extensions rustls has no implementation for, as Firefox states them.
+    const RAW_EXTENSIONS: [(ExtensionType, &[u8]); 5] = [
+        (ExtensionType::RenegotiationInfo, &[0x00]),
+        (ExtensionType::SessionTicket, &[]),
+        (
+            ExtensionType::DelegatedCredentials,
+            &[0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03],
+        ),
+        (ExtensionType::SCT, &[]),
+        (ExtensionType::RecordSizeLimit, &[0x40, 0x01]),
+    ];
 }
 
 impl ClientHelloProfile for FirefoxShape {
+    fn extension_order(&self, available: &[ExtensionType]) -> Option<Vec<ExtensionType>> {
+        let mut order: Vec<_> = Self::EXTENSION_ORDER
+            .iter()
+            .copied()
+            .filter(|typ| available.contains(typ))
+            .collect();
+        let extra: Vec<_> = available
+            .iter()
+            .copied()
+            .filter(|typ| !order.contains(typ))
+            .collect();
+        order.extend(extra);
+        Some(order)
+    }
+
     fn cipher_suites(&self, _available: &[SupportedCipherSuite]) -> Option<Vec<CipherSuite>> {
         Some(Self::CIPHER_SUITES.to_vec())
     }
@@ -1241,6 +1418,60 @@ impl ClientHelloProfile for FirefoxShape {
         _available: &[&'static dyn SupportedKxGroup],
     ) -> Option<Vec<&'static dyn SupportedKxGroup>> {
         Some(self.key_share_groups.clone())
+    }
+
+    fn session_id(&self, client_random: &[u8; 32]) -> Option<[u8; 32]> {
+        Some(fake_sid(client_random))
+    }
+
+    fn raw_extensions(&self) -> Vec<(ExtensionType, Vec<u8>)> {
+        Self::RAW_EXTENSIONS
+            .iter()
+            .map(|(typ, body)| (*typ, body.to_vec()))
+            .collect()
+    }
+}
+
+/// States Firefox's `signature_algorithms`, which is where that extension comes
+/// from: rustls takes the list from the verifier.
+#[derive(Debug)]
+struct FirefoxVerifier;
+
+impl ServerCertVerifier for FirefoxVerifier {
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        unreachable!()
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        unreachable!()
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        unreachable!()
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        FirefoxShape::SIGNATURE_SCHEMES.to_vec()
     }
 }
 
