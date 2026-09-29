@@ -27,7 +27,7 @@ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
 use crate::msgs::base::Payload;
-use crate::msgs::enums::{Compression, ExtensionType};
+use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
     ClientSessionTicket, ClientTicketRequest, EncryptedClientHello, HandshakeMessagePayload,
@@ -56,9 +56,38 @@ struct ExpectServerHello {
     //
     // If this is `None` then we do not support early data.
     early_data_key_schedule: Option<KeyScheduleEarly>,
-    offered_key_share: Option<Box<dyn ActiveKeyExchange>>,
+    offered_key_shares: Option<OfferedKeyShares>,
     suite: Option<SupportedCipherSuite>,
     ech_state: Option<EchState>,
+}
+
+/// The key shares offered in a `ClientHello`.
+pub(super) struct OfferedKeyShares {
+    /// One exchange per group the server may pick.  Each exchange holds the
+    /// private key for the share of the same `group()` that we sent for it.
+    pub(super) exchanges: Vec<Box<dyn ActiveKeyExchange>>,
+    /// Whether the first exchange may additionally contribute an entry for its
+    /// hybrid component, sharing the one classical key exchange it already did.
+    /// This is rustls's own optimisation and is only used for the choice rustls
+    /// makes itself, not for a profile's list.
+    pub(super) offer_hybrid_component: bool,
+}
+
+impl OfferedKeyShares {
+    /// Whether a share we sent already covers `group`, either because it is
+    /// that share's own group or because it is the component of a hybrid share.
+    fn covers(&self, group: NamedGroup, config: &ClientConfig) -> bool {
+        self.exchanges.iter().any(|kx| {
+            kx.group() == group
+                || kx
+                    .hybrid_component()
+                    .and_then(|(component, _)| {
+                        config.find_kx_group(component, ProtocolVersion::TLSv1_3)
+                    })
+                    .map(|skxg| skxg.name())
+                    == Some(group)
+        })
+    }
 }
 
 struct ExpectServerHelloOrHelloRetryRequest {
@@ -153,8 +182,8 @@ impl ClientHelloInput {
             transcript_buffer.set_client_auth_enabled();
         }
 
-        let key_share = if self.config.needs_key_share() {
-            Some(tls13::initial_key_share(
+        let key_shares = if self.config.needs_key_share() {
+            Some(tls13::initial_key_shares(
                 &self.config,
                 &self.server_name,
                 &mut cx.common.kx_state,
@@ -173,7 +202,7 @@ impl ClientHelloInput {
         emit_client_hello_for_retry(
             transcript_buffer,
             None,
-            key_share,
+            key_shares,
             extra_exts,
             None,
             self,
@@ -191,7 +220,7 @@ impl ClientHelloInput {
 fn emit_client_hello_for_retry(
     mut transcript_buffer: HandshakeHashBuffer,
     retryreq: Option<&HelloRetryRequest>,
-    key_share: Option<Box<dyn ActiveKeyExchange>>,
+    key_shares: Option<OfferedKeyShares>,
     extra_exts: ClientExtensionsInput<'static>,
     suite: Option<SupportedCipherSuite>,
     mut input: ClientHelloInput,
@@ -212,17 +241,34 @@ fn emit_client_hello_for_retry(
     // should be unreachable thanks to config builder
     assert!(supported_versions.any(|_| true));
 
-    let mut exts = Box::new(ClientExtensions {
-        // offer groups which are usable for any offered version
-        named_groups: Some(
-            config
-                .provider
-                .kx_groups
+    let profile = config.client_hello_profile.as_deref();
+
+    // offer groups which are usable for any offered version
+    let available_groups: Vec<_> = config
+        .provider
+        .kx_groups
+        .iter()
+        .copied()
+        .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
+        .collect();
+    let named_groups = profile
+        .and_then(|profile| {
+            profile.named_groups(
+                &available_groups
+                    .iter()
+                    .map(|g| g.name())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_else(|| {
+            available_groups
                 .iter()
-                .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
-                .map(|skxg| skxg.name())
-                .collect(),
-        ),
+                .map(|g| g.name())
+                .collect()
+        });
+
+    let mut exts = Box::new(ClientExtensions {
+        named_groups: Some(named_groups),
         supported_versions: Some(supported_versions),
         signature_schemes: Some(
             config
@@ -286,26 +332,31 @@ fn emit_client_hello_for_retry(
         (None, false) => None,
     };
 
-    if let Some(key_share) = &key_share {
+    if let Some(key_shares) = &key_shares {
         debug_assert!(supported_versions.tls13);
-        let mut shares = vec![KeyShareEntry::new(key_share.group(), key_share.pub_key())];
+        let mut shares: Vec<_> = key_shares
+            .exchanges
+            .iter()
+            .map(|kx| KeyShareEntry::new(kx.group(), kx.pub_key()))
+            .collect();
 
-        if !retryreq
-            .map(|rr| rr.key_share.is_some())
-            .unwrap_or_default()
+        if key_shares.offer_hybrid_component
+            && !retryreq
+                .map(|rr| rr.key_share.is_some())
+                .unwrap_or_default()
         {
+            debug_assert_eq!(key_shares.exchanges.len(), 1);
             // Only for the initial client hello, or a HRR that does not specify a kx group,
             // see if we can send a second KeyShare for "free".  We only do this if the same
             // algorithm is also supported separately by our provider for this version
             // (`find_kx_group` looks that up).
-            if let Some((component_group, component_share)) =
-                key_share
-                    .hybrid_component()
-                    .filter(|(group, _)| {
-                        config
-                            .find_kx_group(*group, ProtocolVersion::TLSv1_3)
-                            .is_some()
-                    })
+            if let Some((component_group, component_share)) = key_shares.exchanges[0]
+                .hybrid_component()
+                .filter(|(group, _)| {
+                    config
+                        .find_kx_group(*group, ProtocolVersion::TLSv1_3)
+                        .is_some()
+                })
             {
                 shares.push(KeyShareEntry::new(component_group, component_share));
             }
@@ -401,20 +452,30 @@ fn emit_client_hello_for_retry(
         }
     }
 
-    let mut cipher_suites: Vec<_> = config
-        .provider
-        .cipher_suites
-        .iter()
-        .filter_map(|cs| match cs.usable_for_protocol(cx.common.protocol) {
-            true => Some(cs.suite()),
-            false => None,
-        })
-        .collect();
+    let cipher_suites = match profile.and_then(|p| p.cipher_suites(&config.provider.cipher_suites))
+    {
+        // A profile states the whole list, including suites rustls cannot
+        // implement: the point is to reproduce an offer, and one we cannot run
+        // ends the handshake if the server selects it.
+        Some(cipher_suites) => cipher_suites,
+        None => {
+            let mut cipher_suites: Vec<_> = config
+                .provider
+                .cipher_suites
+                .iter()
+                .filter_map(|cs| match cs.usable_for_protocol(cx.common.protocol) {
+                    true => Some(cs.suite()),
+                    false => None,
+                })
+                .collect();
 
-    if supported_versions.tls12 {
-        // We don't do renegotiation at all, in fact.
-        cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
-    }
+            if supported_versions.tls12 {
+                // We don't do renegotiation at all, in fact.
+                cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+            }
+            cipher_suites
+        }
+    };
 
     let mut chp_payload = ClientHelloPayload {
         client_version: ProtocolVersion::TLSv1_2,
@@ -550,7 +611,7 @@ fn emit_client_hello_for_retry(
         input,
         transcript_buffer,
         early_data_key_schedule,
-        offered_key_share: key_share,
+        offered_key_shares: key_shares,
         suite,
         ech_state,
     };
@@ -884,7 +945,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
                     transcript,
                     self.early_data_key_schedule,
                     // We always send a key share when TLS 1.3 is enabled.
-                    self.offered_key_share.unwrap(),
+                    self.offered_key_shares.unwrap(),
                     &m,
                     self.ech_state,
                     self.input,
@@ -925,21 +986,14 @@ impl ExpectServerHelloOrHelloRetryRequest {
         cx.common.check_aligned_handshake()?;
 
         // We always send a key share when TLS 1.3 is enabled.
-        let offered_key_share = self.next.offered_key_share.unwrap();
+        let offered_key_shares = self.next.offered_key_shares.unwrap();
 
         // A retry request is illegal if it contains no cookie and asks for
         // retry of a group we already sent.
         let config = &self.next.input.config;
 
         if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
-            let offered_hybrid = offered_key_share
-                .hybrid_component()
-                .and_then(|(group_name, _)| {
-                    config.find_kx_group(group_name, ProtocolVersion::TLSv1_3)
-                })
-                .map(|skxg| skxg.name());
-
-            if req_group == offered_key_share.group() || Some(req_group) == offered_hybrid {
+            if offered_key_shares.covers(req_group, config) {
                 return Err({
                     cx.common.send_fatal_alert(
                         AlertDescription::IllegalParameter,
@@ -1067,8 +1121,10 @@ impl ExpectServerHelloOrHelloRetryRequest {
             cx.data.early_data.rejected();
         }
 
-        let key_share = match hrr.key_share {
-            Some(group) if group != offered_key_share.group() => {
+        let key_shares = match hrr.key_share {
+            // RFC 8446 4.1.4: the second ClientHello carries a single key share,
+            // for the group the server asked for.
+            Some(group) => {
                 let Some(skxg) = config.find_kx_group(group, ProtocolVersion::TLSv1_3) else {
                     return Err(cx.common.send_fatal_alert(
                         AlertDescription::IllegalParameter,
@@ -1077,15 +1133,19 @@ impl ExpectServerHelloOrHelloRetryRequest {
                 };
 
                 cx.common.kx_state = KxState::Start(skxg);
-                skxg.start()?
+                OfferedKeyShares {
+                    exchanges: vec![skxg.start()?],
+                    offer_hybrid_component: false,
+                }
             }
-            _ => offered_key_share,
+            // A retry that only carries a cookie reuses the shares we sent.
+            None => offered_key_shares,
         };
 
         emit_client_hello_for_retry(
             transcript_buffer,
             Some(hrr),
-            Some(key_share),
+            Some(key_shares),
             self.extra_exts,
             Some(cs),
             self.next.input,

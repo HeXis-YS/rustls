@@ -11,7 +11,7 @@ use pki_types::{CertificateDer, ServerName};
 use crate::client::{
     ClientConfig, ClientConnection, ClientHelloProfile, Resumption, Tls12Resumption,
 };
-use crate::crypto::CryptoProvider;
+use crate::crypto::{ActiveKeyExchange, CryptoProvider, SupportedKxGroup};
 use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
 use crate::msgs::base::PayloadU16;
 use crate::msgs::codec::{Codec, Reader};
@@ -22,7 +22,7 @@ use crate::msgs::handshake::{
 };
 use crate::msgs::message::{Message, MessagePayload, OutboundOpaqueMessage};
 use crate::sync::Arc;
-use crate::{Error, PeerIncompatible, PeerMisbehaved, RootCertStore};
+use crate::{Error, PeerIncompatible, PeerMisbehaved, RootCertStore, SupportedCipherSuite};
 
 #[macro_rules_attribute::apply(test_for_each_provider)]
 mod tests {
@@ -112,6 +112,155 @@ mod tests {
 
         assert_ne!(order, vec![ExtensionType::Cookie]);
         assert!(order.len() > 3, "expected the offered set, got {order:?}");
+    }
+
+    #[test]
+    fn client_hello_profile_pins_cipher_suites_groups_and_key_shares() {
+        // The three dimensions JA3 reads off.  The suite list deliberately
+        // names suites rustls has no implementation for, and the group list
+        // names FFDHE groups no built-in provider supplies: a profile states
+        // someone else's offer, not our capabilities.
+        let provider = super::provider::default_provider();
+        let key_share_groups: Vec<_> = provider
+            .kx_groups
+            .iter()
+            .rev()
+            .take(2)
+            .copied()
+            .collect();
+        let key_share_names: Vec<_> = key_share_groups
+            .iter()
+            .map(|group| group.name())
+            .collect();
+
+        let mut config = ClientConfig::builder_with_provider(provider.into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_profile = Some(Arc::new(FirefoxShape { key_share_groups }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+
+        assert_eq!(ch.cipher_suites, FirefoxShape::CIPHER_SUITES);
+        assert_eq!(
+            ch.extensions.named_groups.as_deref(),
+            Some(&FirefoxShape::NAMED_GROUPS[..])
+        );
+        assert_eq!(
+            ch.extensions
+                .key_shares
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|share| share.group)
+                .collect::<Vec<_>>(),
+            key_share_names
+        );
+    }
+
+    #[test]
+    fn client_hello_profile_rejects_key_share_group_it_cannot_start() {
+        // Advertising a group we cannot use is fine: the offer is just bytes,
+        // and a server that insists on it gets a fatal `HelloRetryRequest`
+        // failure.  Sending a *share* for one is not, because a share promises
+        // a private key we do not have.
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        let unstartable: &'static dyn SupportedKxGroup = &UnstartableKxGroup;
+        config.client_hello_profile = Some(Arc::new(FirefoxShape {
+            key_share_groups: vec![unstartable],
+        }));
+
+        assert!(matches!(
+            ClientConnection::new(config.into(), ServerName::try_from("localhost").unwrap()),
+            Err(Error::General(_))
+        ));
+    }
+
+    /// A key share is sized by its group, and the sizes are what the captured
+    /// Firefox `ClientHello` shows: 1216 / 32 / 65 bytes for this triple, plus
+    /// 4 bytes of group and length per entry and the list's own 2 byte length.
+    #[cfg(feature = "aws_lc_rs")]
+    #[test]
+    fn client_hello_profile_key_shares_match_firefox_sizes() {
+        use crate::crypto::aws_lc_rs::kx_group::{SECP256R1, X25519, X25519MLKEM768};
+
+        let mlkem: &'static dyn SupportedKxGroup = X25519MLKEM768;
+        let x25519: &'static dyn SupportedKxGroup = X25519;
+        let p256: &'static dyn SupportedKxGroup = SECP256R1;
+
+        let mut config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+        config.client_hello_profile = Some(Arc::new(FirefoxShape {
+            key_share_groups: vec![mlkem, x25519, p256],
+        }));
+
+        let ch = client_hello_sent_for_config(config).unwrap();
+        let shares = ch
+            .extensions
+            .key_shares
+            .as_ref()
+            .unwrap();
+
+        let mut encoded = Vec::new();
+        shares.clone().encode(&mut encoded);
+        assert_eq!(encoded.len(), 1327);
+    }
+
+    /// A profile can name suites rustls has no implementation for -- that is
+    /// what reproducing someone else's offer means -- but being unable to run
+    /// one is not a reason to accept it.  A server that selects such a suite
+    /// ends the handshake.
+    #[test]
+    fn client_hello_profile_fails_on_a_suite_rustls_cannot_run() {
+        let provider = super::provider::default_provider();
+        let mut config = ClientConfig::builder_with_provider(provider.clone().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots())
+            .with_no_client_auth();
+        config.client_hello_profile = Some(Arc::new(FirefoxShape {
+            key_share_groups: provider.kx_groups.clone(),
+        }));
+        let config = Arc::new(config);
+
+        let mut conn =
+            ClientConnection::new(config.clone(), ServerName::try_from("localhost").unwrap())
+                .unwrap();
+        let mut sent = Vec::new();
+        conn.write_tls(&mut sent).unwrap();
+
+        // A TLS 1.2 ServerHello (no `supported_versions` extension) selecting one
+        // of the static-RSA suites the profile added.
+        let sh = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::handshake(HandshakeMessagePayload(
+                HandshakePayload::ServerHello(ServerHelloPayload {
+                    random: Random::new(config.provider.secure_random).unwrap(),
+                    compression_method: Compression::Null,
+                    cipher_suite: CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256,
+                    legacy_version: ProtocolVersion::TLSv1_2,
+                    session_id: SessionId::empty(),
+                    extensions: Box::new(ServerExtensions::default()),
+                }),
+            )),
+        };
+        conn.read_tls(&mut sh.into_wire_bytes().as_slice())
+            .unwrap();
+
+        assert_eq!(
+            conn.process_new_packets(),
+            Err(PeerMisbehaved::SelectedUnofferedCipherSuite.into())
+        );
     }
 
     #[test]
@@ -824,6 +973,80 @@ struct BogusExtensionOrder;
 impl ClientHelloProfile for BogusExtensionOrder {
     fn extension_order(&self, _available: &[ExtensionType]) -> Option<Vec<ExtensionType>> {
         Some(vec![ExtensionType::Cookie])
+    }
+}
+
+/// Pins all three dimensions JA3 reads off, using Firefox ESR 153's values.
+#[derive(Debug)]
+struct FirefoxShape {
+    key_share_groups: Vec<&'static dyn SupportedKxGroup>,
+}
+
+impl FirefoxShape {
+    /// Firefox's `cipherSuites[]`.  The four static-RSA and three CBC-SHA
+    /// entries are suites rustls cannot run; they are offered anyway, and a
+    /// server that selects one ends the handshake.
+    const CIPHER_SUITES: [CipherSuite; 16] = [
+        CipherSuite::TLS13_AES_128_GCM_SHA256,
+        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+        CipherSuite::TLS13_AES_256_GCM_SHA384,
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+        CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256,
+        CipherSuite::TLS_RSA_WITH_AES_256_GCM_SHA384,
+        CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+        CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
+    ];
+
+    /// Firefox's `SSL_NamedGroupConfig`, whose last two entries are FFDHE
+    /// groups no built-in provider offers.
+    const NAMED_GROUPS: [NamedGroup; 7] = [
+        NamedGroup::X25519MLKEM768,
+        NamedGroup::X25519,
+        NamedGroup::secp256r1,
+        NamedGroup::secp384r1,
+        NamedGroup::secp521r1,
+        NamedGroup::FFDHE2048,
+        NamedGroup::FFDHE3072,
+    ];
+}
+
+impl ClientHelloProfile for FirefoxShape {
+    fn cipher_suites(&self, _available: &[SupportedCipherSuite]) -> Option<Vec<CipherSuite>> {
+        Some(Self::CIPHER_SUITES.to_vec())
+    }
+
+    fn named_groups(&self, _available: &[NamedGroup]) -> Option<Vec<NamedGroup>> {
+        Some(Self::NAMED_GROUPS.to_vec())
+    }
+
+    fn key_share_groups(
+        &self,
+        _available: &[&'static dyn SupportedKxGroup],
+    ) -> Option<Vec<&'static dyn SupportedKxGroup>> {
+        Some(self.key_share_groups.clone())
+    }
+}
+
+/// A group no provider offers, standing in for a profile that promises a key
+/// share it cannot start.
+#[derive(Debug)]
+struct UnstartableKxGroup;
+
+impl SupportedKxGroup for UnstartableKxGroup {
+    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+        unreachable!("never started: it is not one of the provider's groups")
+    }
+
+    fn name(&self) -> NamedGroup {
+        NamedGroup::FFDHE2048
     }
 }
 

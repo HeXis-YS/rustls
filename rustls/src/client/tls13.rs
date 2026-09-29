@@ -1,4 +1,6 @@
 use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -6,7 +8,7 @@ use pki_types::ServerName;
 use subtle::ConstantTimeEq;
 
 use super::client_conn::ClientConnectionData;
-use super::hs::{ClientContext, ClientHelloInput, ClientSessionValue};
+use super::hs::{ClientContext, ClientHelloInput, ClientSessionValue, OfferedKeyShares};
 use crate::check::inappropriate_handshake_message;
 use crate::client::common::{ClientAuthDetails, ClientHelloDetails, ServerCertDetails};
 use crate::client::ech::{self, EchState, EchStatus};
@@ -74,7 +76,7 @@ pub(super) fn handle_server_hello(
     suite: &'static Tls13CipherSuite,
     mut transcript: HandshakeHash,
     early_data_key_schedule: Option<KeyScheduleEarly>,
-    our_key_share: Box<dyn ActiveKeyExchange>,
+    our_key_shares: OfferedKeyShares,
     server_hello_msg: &Message<'_>,
     ech_state: Option<EchState>,
     input: ClientHelloInput,
@@ -108,13 +110,15 @@ pub(super) fn handle_server_hello(
         _ => None,
     };
 
-    let our_key_share = KeyExchangeChoice::new(&config, cx, our_key_share, their_key_share)
-        .map_err(|_| {
-            cx.common.send_fatal_alert(
-                AlertDescription::IllegalParameter,
-                PeerMisbehaved::WrongGroupForKeyShare,
-            )
-        })?;
+    let our_key_share =
+        KeyExchangeChoice::new(&config, cx, our_key_shares.exchanges, their_key_share).map_err(
+            |_| {
+                cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::WrongGroupForKeyShare,
+                )
+            },
+        )?;
 
     let key_schedule_pre_handshake = match (server_hello.preshared_key, early_data_key_schedule) {
         (Some(selected_psk), Some(early_key_schedule)) => {
@@ -255,25 +259,38 @@ enum KeyExchangeChoice {
 }
 
 impl KeyExchangeChoice {
-    /// Decide between `our_key_share` or `our_key_share.hybrid_component()`
-    /// based on the selection of the server expressed in `their_key_share`.
+    /// Pick, out of the shares we offered, the one that matches the server's
+    /// selection expressed in `their_key_share`: either a share whose own group
+    /// it is, or -- for a hybrid share -- one whose component it is.
     fn new(
         config: &Arc<ClientConfig>,
         cx: &mut ClientContext<'_>,
-        our_key_share: Box<dyn ActiveKeyExchange>,
+        our_key_shares: Vec<Box<dyn ActiveKeyExchange>>,
         their_key_share: &KeyShareEntry,
     ) -> Result<Self, ()> {
-        if our_key_share.group() == their_key_share.group {
-            return Ok(Self::Whole(our_key_share));
+        let mut component = None;
+
+        for key_share in our_key_shares {
+            if key_share.group() == their_key_share.group {
+                // correct the record for the benefit of accuracy of
+                // `negotiated_key_exchange_group()`
+                let skxg = config
+                    .find_kx_group(key_share.group(), ProtocolVersion::TLSv1_3)
+                    .ok_or(())?;
+                cx.common.kx_state = KxState::Start(skxg);
+                return Ok(Self::Whole(key_share));
+            }
+
+            if key_share
+                .hybrid_component()
+                .is_some_and(|(group, _)| group == their_key_share.group)
+            {
+                component = Some(key_share);
+            }
         }
 
-        let (component_group, _) = our_key_share
-            .hybrid_component()
-            .ok_or(())?;
-
-        if component_group != their_key_share.group {
-            return Err(());
-        }
+        let key_share = component.ok_or(())?;
+        let (component_group, _) = key_share.hybrid_component().ok_or(())?;
 
         // correct the record for the benefit of accuracy of
         // `negotiated_key_exchange_group()`
@@ -282,7 +299,7 @@ impl KeyExchangeChoice {
             .ok_or(())?;
         cx.common.kx_state = KxState::Start(actual_skxg);
 
-        Ok(Self::Component(our_key_share))
+        Ok(Self::Component(key_share))
     }
 
     fn complete(self, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
@@ -307,11 +324,50 @@ fn validate_server_hello(
     Ok(())
 }
 
-pub(super) fn initial_key_share(
+pub(super) fn initial_key_shares(
     config: &ClientConfig,
     server_name: &ServerName<'_>,
     kx_state: &mut KxState,
-) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+) -> Result<OfferedKeyShares, Error> {
+    // A profile states which groups get a share, in wire order.  A share is a
+    // public key whose private half we have to hold until the server answers, so
+    // every named group has to be one the provider can actually start.
+    if let Some(groups) = config
+        .client_hello_profile
+        .as_deref()
+        .and_then(|profile| profile.key_share_groups(&config.provider.kx_groups))
+    {
+        if groups.is_empty() {
+            return Err(Error::General(String::from(
+                "client hello profile named no key share groups",
+            )));
+        }
+
+        for group in &groups {
+            if !config
+                .provider
+                .kx_groups
+                .iter()
+                .any(|available| available.name() == group.name())
+            {
+                return Err(Error::General(format!(
+                    "client hello profile named unsupported key share group {:?}",
+                    group.name()
+                )));
+            }
+        }
+
+        *kx_state = KxState::Start(groups[0]);
+        let exchanges = groups
+            .iter()
+            .map(|group| group.start())
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(OfferedKeyShares {
+            exchanges,
+            offer_hybrid_component: false,
+        });
+    }
+
     let group = config
         .resumption
         .store
@@ -328,7 +384,10 @@ pub(super) fn initial_key_share(
         });
 
     *kx_state = KxState::Start(group);
-    group.start()
+    Ok(OfferedKeyShares {
+        exchanges: vec![group.start()?],
+        offer_hybrid_component: true,
+    })
 }
 
 /// This implements the horrifying TLS1.3 hack where PSK binders have a
