@@ -302,9 +302,21 @@ mod tests {
         // this extension is the same length in every ClientHello it sends.
         assert_eq!(body(ExtensionType::EncryptedClientHello).len(), 281);
         if compression {
-            // Firefox states zlib, brotli and zstd (7 bytes); this fork has no
-            // zstd decompressor, so it states only the first two.
-            assert_eq!(body(ExtensionType::CompressCertificate).len(), 5);
+            // Firefox states `zlib`, `brotli`, `zstd` in that order (7 bytes);
+            // this fork has no `zstd` decompressor, so the table is Firefox's
+            // first two entries, in Firefox's order (by algorithm number).
+            let algorithms: &[u16] = &[
+                #[cfg(feature = "zlib")]
+                0x00_01,
+                #[cfg(feature = "brotli")]
+                0x00_02,
+            ];
+            // The list's length is in bytes, two per algorithm (RFC 8879).
+            let mut expected = vec![(algorithms.len() * 2) as u8];
+            for algorithm in algorithms {
+                expected.extend_from_slice(&algorithm.to_be_bytes());
+            }
+            assert_eq!(body(ExtensionType::CompressCertificate), expected);
         }
 
         let bytes: usize = types

@@ -51,9 +51,8 @@ fn fake_sid(random: &[u8; 32]) -> [u8; 32] {
 ///   separately (`ClientConfig::set_ech_grease`), not stated here.
 /// * The two known differences that remain after that: this fork has no `zstd`
 ///   certificate decompressor, so the `certificate_compression` extension
-///   states two algorithms where Firefox states three, and it states them in
-///   the order the build's decompressors come in (brotli, zlib) rather than
-///   Firefox's (zlib, brotli, zstd).
+///   states two algorithms where Firefox states three (`zlib`, `brotli`,
+///   `zstd` in that order).
 #[derive(Debug)]
 pub struct FirefoxEsr153 {
     key_share_groups: Vec<&'static dyn SupportedKxGroup>,
@@ -81,7 +80,15 @@ impl FirefoxEsr153 {
             key_share_groups: self.key_share_groups.clone(),
         }));
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        config.cert_decompressors = crate::compress::default_cert_decompressors().to_vec();
+        // Firefox's order (`zlib`, `brotli`, `zstd`), which is by algorithm
+        // number, not the order this crate's defaults come in.  The `zstd`
+        // entry has no counterpart here; see the type documentation.
+        config.cert_decompressors = vec![
+            #[cfg(feature = "zlib")]
+            crate::compress::ZLIB_DECOMPRESSOR,
+            #[cfg(feature = "brotli")]
+            crate::compress::BROTLI_DECOMPRESSOR,
+        ];
     }
 
     /// Firefox's `cipherSuites[]`.  The four static-RSA and three CBC-SHA
