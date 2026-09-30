@@ -228,25 +228,15 @@ mod tests {
     #[cfg(feature = "aws_lc_rs")]
     #[test]
     fn client_hello_profile_reproduces_firefox_esr153_shape() {
-        use crate::crypto::aws_lc_rs::hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
-        use crate::crypto::hpke::Hpke;
-
         let mut config =
             ClientConfig::builder_with_provider(super::provider::default_provider().into())
                 .with_safe_default_protocol_versions()
                 .unwrap()
                 .with_root_certificates(roots())
                 .with_no_client_auth();
+        // The preset installs the GREASE ECH extension too: Firefox sends one
+        // in every hello, at one constant size.
         crate::client::FirefoxEsr153::new().apply(&mut config);
-        // Firefox pads its inner hello to a constant size, so the GREASE ECH
-        // extension is the same length in every ClientHello it sends.
-        let (placeholder_key, _) = DH_KEM_X25519_HKDF_SHA256_AES_128
-            .generate_key_pair()
-            .unwrap();
-        config.set_ech_grease(
-            EchGreaseConfig::new(DH_KEM_X25519_HKDF_SHA256_AES_128, placeholder_key)
-                .with_payload_len(239),
-        );
         let for_record_len = config.clone();
 
         let compression = !config.cert_decompressors.is_empty();

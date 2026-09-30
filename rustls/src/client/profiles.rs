@@ -17,9 +17,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ClientConfig;
-use crate::client::ClientHelloProfile;
+use crate::client::{ClientHelloProfile, EchGreaseConfig};
 use crate::crypto::SupportedKxGroup;
+use crate::crypto::aws_lc_rs::hpke::{
+    DH_KEM_X25519_HKDF_SHA256_AES_128, DH_KEM_X25519_HKDF_SHA256_CHACHA20_POLY1305,
+};
 use crate::crypto::aws_lc_rs::kx_group::{SECP256R1, X25519, X25519MLKEM768};
+use crate::crypto::hpke::{Hpke, HpkePublicKey};
 use crate::enums::{CipherSuite, SignatureScheme};
 use crate::msgs::enums::{ExtensionType, NamedGroup};
 use crate::suites::SupportedCipherSuite;
@@ -42,21 +46,41 @@ fn fake_sid(random: &[u8; 32]) -> [u8; 32] {
 
 /// The `ClientHello` of Firefox ESR 153.
 ///
-/// [`Self::apply`] installs it, which is the whole of what a caller does to
-/// send this shape.  What it does not cover, and why:
+/// [`Self::apply`] installs it -- the profile, the ALPN list, the certificate
+/// decompressors and the GREASE ECH extension -- which is the whole of what a
+/// caller does to send this shape.  What it does not cover, and why:
 ///
-/// * GREASE ECH (extension `0xfe0d`), which Firefox sends at one constant size
-///   (285 B on the wire).  It needs an HPKE suite and a throwaway key, both of
-///   which are provider- and run-time values, so it is set on the configuration
-///   separately (`ClientConfig::set_ech_grease`), not stated here.
-/// * The two known differences that remain after that: this fork has no `zstd`
+/// * The one known difference that remains: this fork has no `zstd`
 ///   certificate decompressor, so the `certificate_compression` extension
 ///   states two algorithms where Firefox states three (`zlib`, `brotli`,
 ///   `zstd` in that order).
 #[derive(Debug)]
 pub struct FirefoxEsr153 {
     key_share_groups: Vec<&'static dyn SupportedKxGroup>,
+    /// The public key the GREASE ECH extension encapsulates to.  Nothing holds
+    /// its private half, which is what makes it a placeholder: the extension
+    /// is never decrypted, and the encapsulation only has to be one the KEM
+    /// could have produced.
+    placeholder_key: HpkePublicKey,
 }
+
+/// Firefox's GREASE ECH cipher suites.
+///
+/// NSS supports two symmetric suites for HPKE, and draft-ietf-tls-esni section
+/// 6.2 asks the extension's selection to vary between the client's supported
+/// configurations rather than state one forever, so both are offered.  They
+/// share the X25519 key encapsulation mechanism, which is what the placeholder
+/// key is generated for.
+static GREASE_SUITES: [&dyn Hpke; 2] = [
+    DH_KEM_X25519_HKDF_SHA256_AES_128,
+    DH_KEM_X25519_HKDF_SHA256_CHACHA20_POLY1305,
+];
+
+/// Firefox's GREASE ECH payload, in bytes.
+///
+/// The inner hello is padded to a constant length and the AEAD tag is appended,
+/// so the extension body is 281 B in every hello and 285 B on the wire.
+const GREASE_PAYLOAD_LEN: usize = 239;
 
 impl FirefoxEsr153 {
     /// The shape of the first `ClientHello` Firefox ESR 153 sends.
@@ -68,16 +92,26 @@ impl FirefoxEsr153 {
     pub fn new() -> Self {
         let key_share_groups: Vec<&'static dyn SupportedKxGroup> =
             vec![X25519MLKEM768, X25519, SECP256R1];
-        Self { key_share_groups }
+        // GREASE ECH states a real encapsulation, so it needs a public key the
+        // KEM accepts.  The private half is dropped: the extension's payload is
+        // not a real inner hello, so nothing is ever expected to open it.
+        let (placeholder_key, _) = GREASE_SUITES[0]
+            .generate_key_pair()
+            .expect("an X25519 key pair can always be generated");
+        Self {
+            key_share_groups,
+            placeholder_key,
+        }
     }
 
     /// Install this shape on a client configuration.
     ///
-    /// Sets the profile, the ALPN list and the certificate decompressors.  See
-    /// the type documentation for what is left to the caller.
+    /// Sets the profile, the ALPN list, the certificate decompressors and the
+    /// GREASE ECH extension.  See the type documentation for what is left out.
     pub fn apply(&self, config: &mut ClientConfig) {
         config.client_hello_profile = Some(Arc::new(Self {
             key_share_groups: self.key_share_groups.clone(),
+            placeholder_key: self.placeholder_key.clone(),
         }));
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         // Firefox's order (`zlib`, `brotli`, `zstd`), which is by algorithm
@@ -89,6 +123,15 @@ impl FirefoxEsr153 {
             #[cfg(feature = "brotli")]
             crate::compress::BROTLI_DECOMPRESSOR,
         ];
+        // Firefox's GREASE ECH: an extension every hello carries, whose
+        // cipher suite is drawn from both of the suites above and whose payload
+        // is always the same size.  `new` names the first suite and
+        // `with_suites` the set the draw comes from.
+        config.set_ech_grease(
+            EchGreaseConfig::new(GREASE_SUITES[0], self.placeholder_key.clone())
+                .with_suites(&GREASE_SUITES)
+                .with_payload_len(GREASE_PAYLOAD_LEN),
+        );
     }
 
     /// Firefox's `cipherSuites[]`.  The four static-RSA and three CBC-SHA
