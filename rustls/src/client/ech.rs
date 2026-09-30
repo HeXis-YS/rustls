@@ -52,7 +52,12 @@ impl EchMode {
     pub fn fips(&self) -> bool {
         match self {
             Self::Enable(ech_config) => ech_config.suite.fips(),
-            Self::Grease(grease_config) => grease_config.suite.fips(),
+            // A varying selection is only FIPS approved if every suite it can
+            // land on is.
+            Self::Grease(grease_config) => grease_config
+                .suites
+                .iter()
+                .all(|suite| suite.fips()),
         }
     }
 }
@@ -189,7 +194,7 @@ impl EchConfig {
 /// Configuration for GREASE Encrypted Client Hello.
 #[derive(Clone, Debug)]
 pub struct EchGreaseConfig {
-    pub(crate) suite: &'static dyn Hpke,
+    pub(crate) suites: Vec<&'static dyn Hpke>,
     pub(crate) placeholder_key: HpkePublicKey,
     pub(crate) payload_len: Option<usize>,
 }
@@ -206,10 +211,36 @@ impl EchGreaseConfig {
     /// [^0]: <https://www.rfc-editor.org/rfc/rfc8701>
     pub fn new(suite: &'static dyn Hpke, placeholder_key: HpkePublicKey) -> Self {
         Self {
-            suite,
+            suites: vec![suite],
             placeholder_key,
             payload_len: None,
         }
+    }
+
+    /// Let the advertised cipher suite vary from handshake to handshake.
+    ///
+    /// draft-ietf-tls-esni section 6.2 asks that the choice of `cipher_suite`
+    /// "vary to exercise all supported configurations": a GREASE extension
+    /// that carried one suite forever would tell the network that the suite is
+    /// fixed, which is the ossification GREASE exists to prevent.  One of
+    /// these suites is picked for each `ClientHello` sent.
+    ///
+    /// Every suite must work with the placeholder key, so they have to share
+    /// the key encapsulation mechanism it was generated for.  A suite that
+    /// expands by a different number of bytes also needs
+    /// [`Self::with_payload_len`], which pins the payload instead of deriving
+    /// it from the chosen suite.
+    ///
+    /// # Panics
+    ///
+    /// If `suites` is empty, which would leave nothing to advertise.
+    pub fn with_suites(mut self, suites: &'static [&'static dyn Hpke]) -> Self {
+        assert!(
+            !suites.is_empty(),
+            "a GREASE ECH configuration needs at least one cipher suite"
+        );
+        self.suites = suites.to_vec();
+        self
     }
 
     /// Pin the size of the GREASE payload instead of deriving it from the
@@ -246,7 +277,14 @@ impl EchGreaseConfig {
         let mut config_id: [u8; 1] = [0; 1];
         secure_random.fill(&mut config_id[..])?;
 
-        let suite = self.suite.suite();
+        // Pick this handshake's cipher suite.  The choice is made here, per
+        // ClientHello, so that a configuration naming several suites exercises
+        // all of them rather than stating one forever.
+        let hpke = *self
+            .suites
+            .get(crate::rand::random_u32(secure_random)? as usize % self.suites.len())
+            .expect("a GREASE configuration holds at least one suite");
+        let suite = hpke.suite();
 
         // Construct a dummy ECH state - we don't have a real ECH config from a server since
         // this is for GREASE.
@@ -263,7 +301,7 @@ impl EchGreaseConfig {
                     public_name: DnsName::try_from("filler").unwrap(),
                     extensions: Vec::default(),
                 }),
-                suite: self.suite,
+                suite: hpke,
             },
             inner_name,
             false,

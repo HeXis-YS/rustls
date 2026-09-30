@@ -378,6 +378,60 @@ mod tests {
         assert_eq!(&body[40..42], &[0x00, 0xef], "239-byte payload");
     }
 
+    /// draft-ietf-tls-esni asks GREASE ECH to "vary [the cipher suite] to
+    /// exercise all supported configurations", so a configuration that names
+    /// several suites must not keep sending one.  Nothing else about those
+    /// extensions differs on the wire -- same KEM, same tag length, same pinned
+    /// payload -- so the two `aead_id` bytes are the whole observation.
+    #[cfg(feature = "aws_lc_rs")]
+    #[test]
+    fn grease_ech_cipher_suite_varies_across_handshakes() {
+        use crate::crypto::aws_lc_rs::hpke::{
+            DH_KEM_X25519_HKDF_SHA256_AES_128, DH_KEM_X25519_HKDF_SHA256_CHACHA20_POLY1305,
+        };
+        use crate::crypto::hpke::Hpke;
+
+        static SUITES: [&dyn Hpke; 2] = [
+            DH_KEM_X25519_HKDF_SHA256_AES_128,
+            DH_KEM_X25519_HKDF_SHA256_CHACHA20_POLY1305,
+        ];
+
+        let (placeholder_key, _) = SUITES[0].generate_key_pair().unwrap();
+        let config =
+            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+                .with_ech(EchMode::Grease(
+                    EchGreaseConfig::new(SUITES[0], placeholder_key)
+                        .with_suites(&SUITES)
+                        .with_payload_len(239),
+                ))
+                .unwrap()
+                .with_root_certificates(roots())
+                .with_no_client_auth();
+
+        let mut seen = Vec::new();
+        for _ in 0..64 {
+            let exts = client_hello_extensions(config.clone()).unwrap();
+            let body = exts
+                .iter()
+                .find(|(typ, _)| *typ == ExtensionType::EncryptedClientHello)
+                .expect("no ECH extension")
+                .1
+                .clone();
+            assert_eq!(body.len(), 281, "the payload length is pinned");
+            let aead = u16::from_be_bytes([body[3], body[4]]);
+            assert!(
+                matches!(aead, 1 | 3),
+                "suite outside the configured pair: {aead}"
+            );
+            if !seen.contains(&aead) {
+                seen.push(aead);
+            }
+        }
+        // Sixty-four handshakes all landing on one of two suites has a
+        // probability of 2^-63, so this cannot pass by chance.
+        assert_eq!(seen.len(), 2, "the suite never varied: {seen:?}");
+    }
+
     /// Firefox derives `legacy_session_id` from `ClientHello.random`
     /// (`ssl_MakeFakeSid`) so the field costs no entropy and a passive observer
     /// can recompute it.  A profile states that derivation; the point of the
